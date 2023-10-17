@@ -136,6 +136,13 @@ class Where(Function):
            self.x.e(TernaryOps.WHERE, grad_output, grad_output.const(0)) if self.needs_input_grad[1] else None, \
            self.x.e(TernaryOps.WHERE, grad_output.const(0), grad_output) if self.needs_input_grad[2] else None
 
+class QuantMap(Function):
+  def forward(self, x:LazyBuffer, y:LazyBuffer, z:LazyBuffer, bits:int) -> LazyBuffer:
+    return x.e(TernaryOps.QUANT_MAP, y, z, arg=bits)
+  
+  def backward(self, grad_output:LazyBuffer) -> Tuple[Optional[LazyBuffer], Optional[LazyBuffer]]:
+    assert False, "cannot go backward through a quantization mapping"
+
 # ************* reduce ops *************
 
 class Sum(Function):

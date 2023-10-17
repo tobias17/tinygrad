@@ -203,3 +203,12 @@ def get_child(parent, key):
     else:
       obj = getattr(obj, k)
   return obj
+
+def mem_to_string(n_bytes: float):
+  index = 0
+  while n_bytes > 100:
+    n_bytes /= 1024
+    index += 1
+  units = [" B", "KB", "MB", "GB", "TB", "PB"]
+  bytes_str = f"{n_bytes:.3f}"[:5]
+  return f"{bytes_str} {units[index]}"

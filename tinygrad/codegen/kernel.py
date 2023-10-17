@@ -63,7 +63,7 @@ class Kernel:
 
     # create new shapetrackers inside this kernel, we will permute them
     self.bufs = [MemBuffer(0, self.info.dtype, ShapeTracker.from_shape(self.info.shape))] + dedup([x.arg for x in self.ast.get_lazyops() if x.op in BufferOps])
-    self.sts: List[ShapeTracker] = [x.st for x in self.bufs]
+    self.sts: List[ShapeTracker] = [x.st for x in self.bufs if not (hasattr(x, "direct") and x.direct)]
 
     self.mem_estimate: int = sum(x.dtype.itemsize*x.st.size() for x in self.bufs)
 
@@ -103,9 +103,14 @@ class Kernel:
     acc_strides = [x*(1-upcasted_i[::-1][i][2]) for i,x in enumerate(strides_for_shape(tuple(1 if r else s for s,_,r in upcasted_i[::-1])))]
     return [sum(t) for t in itertools.product(*[[y*acc_strides[i] for y in range(x[0])] for i,x in enumerate(upcasted_i[::-1])])]
 
-  def get_upcast_dim(self, i) -> List[int]:
-    should_upcast = self.opts.supports_float4 and (self.bufs[i].dtype in [dtypes.float32, dtypes.float16] or isinstance(self.bufs[i].dtype, ImageDType))
-    return [x for x in self.sts[i].unit_stride_axes() if should_upcast and x >= self.shape_len-self.upcasted and self.sts[i].shape[x] > 1]
+  def buf_i_to_st_i(self, buf_i) -> Optional[int]:
+    indirect_bufs = [0 if hasattr(b, 'direct') and b.direct else 1 for b in self.bufs]
+    return sum(indirect_bufs[:buf_i]) if indirect_bufs[buf_i] else None
+
+  def get_upcast_dim(self, buf_i) -> List[int]:
+    should_upcast = self.opts.supports_float4 and (self.bufs[buf_i].dtype in [dtypes.float32, dtypes.float16] or isinstance(self.bufs[buf_i].dtype, ImageDType))
+    if (st_i:=self.buf_i_to_st_i(buf_i)) is None: return []
+    return [x for x in self.sts[st_i].unit_stride_axes() if should_upcast and x >= self.shape_len-self.upcasted and self.sts[st_i].shape[x] > 1]
 
   @property
   def first_reduce(self) -> int: return [x!=y for x,y in zip(self.sts[0].shape[:self.shape_len-self.upcasted]+(0,), self.full_shape[:self.shape_len-self.upcasted]+(1,))].index(True)

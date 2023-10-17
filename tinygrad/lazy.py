@@ -55,7 +55,7 @@ def _ast_binaryops(op:LazyOp, shape: Tuple[sint, ...]) -> LazyOp:
   # reshape all the late ops into the output shape
   # NOTE: these RESHAPEs will return self if they don't change the shape
   for x in real_srcs.keys():
-    if real_srcs[x] is None: real_srcs[x] = x.reshape(intermediate_shape)
+    if real_srcs[x] is None: real_srcs[x] = x.reshape(intermediate_shape) if not x.direct else x
   # NOTE: cast the type to remove the Optional
   ast = op.map_buffers(cast(Dict[LazyBuffer, Union[LazyOp, LazyBuffer]], real_srcs))
   return LazyOp(MovementOps.RESHAPE, (ast, ), shape) if intermediate_shape != shape else ast
@@ -66,7 +66,7 @@ def _replace_bufferops(op:LazyOp) -> Tuple[LazyOp, List[LazyBuffer]]:
   for x in op.buffers:
     st = x.st.simplify()
     if x.base in base_bufs:
-      replacements[x] = LazyOp(BufferOps.MEM, (), MemBuffer(base_bufs.index(x.base)+1, x.dtype, st))
+      replacements[x] = LazyOp(BufferOps.MEM, (), MemBuffer(base_bufs.index(x.base)+1, x.dtype, st, x.direct))
     elif not x.realized and x.base.op.op == LoadOps.CONST:
       replacements[x] = LazyOp(BufferOps.CONST, (), ConstBuffer(float(x.base.op.arg), x.dtype, st))
     else:
@@ -116,6 +116,8 @@ class LazyBuffer:
     self._base = base
     if base: base.views.add(self)
     else: assert st.contiguous, "unbased LazyBuffers must be contiguous"
+    self.direct = False
+    self.temporary = False
 
   @property
   def var_vals_key(self): return tuple(sorted(self.var_vals.keys()))
@@ -131,6 +133,11 @@ class LazyBuffer:
   def realized(self, val):
     assert self._base is None, "no setting realized of based LazyBuffers"
     self._realized = val
+  def cleanse(self):
+    assert self.temporary, f"cannot cleanse data from a non-temporary buffer"
+    self._realized = None
+    for buf in self.op.buffers:
+      if buf.temporary: buf.cleanse()
   @property
   def dtype(self): return self.base._dtype
   @dtype.setter
@@ -221,7 +228,7 @@ class LazyBuffer:
     if SHUFFLE_MOVEMENT_OPS: srcs = _push_movement_ops(srcs)
 
     # get outputs now
-    out_device, out_shape, out_dtype = srcs[0].device, srcs[0].shape, max([x.dtype for x in srcs]) if op != UnaryOps.CAST else cast(Tuple[DType, bool], arg)[0]
+    out_device, out_shape, out_dtype = srcs[0].device, srcs[0].shape, srcs[2].dtype if op == TernaryOps.QUANT_MAP else max([x.dtype for x in srcs]) if op != UnaryOps.CAST else cast(Tuple[DType, bool], arg)[0]
 
     # push all contiguous to the end of BinaryOps. kernels 198 -> 196
     if PUSH_CONTIGUOUS and any(not x.realized and x.op.op == LoadOps.CONTIGUOUS and len(x.op.src[0].children) <= 1 for x in srcs):

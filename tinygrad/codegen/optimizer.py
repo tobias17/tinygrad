@@ -163,7 +163,7 @@ class OptimizedKernel(Kernel):
     self.simplify_ones()
 
   def required_optimizations(self, early_only=False):
-    for buf_index,buf in enumerate(self.bufs):
+    for buf_index,buf in enumerate([b for b in self.bufs if not (hasattr(b, "direct") and b.direct)]):
       unit_stride_axes_mul_4 = [i for i in self.sts[buf_index].unit_stride_axes(ignore_valid=True) if self.sts[buf_index].shape[i]%4 == 0]
       if (not early_only or buf in self.earlybufs) and self.bufs[buf_index].dtype.__class__ is ImageDType:
         assert len(unit_stride_axes_mul_4) >= 1, f"needs a unit stride axis in {self.bufs[buf_index]}"

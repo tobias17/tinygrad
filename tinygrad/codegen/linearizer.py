@@ -59,33 +59,34 @@ class Linearizer(OptimizedKernel):
     SumNode: lambda self,ops,ctx: functools.reduce(lambda a,b: ctx.uop_alu_idx(a, b, ops, ctx, BinaryOps.ADD), self.nodes[1:], self.nodes[0].render(ops,ctx)),
     AndNode: lambda self,ops,ctx: functools.reduce(lambda a,b: ctx.uop_alu_idx(a, b, ops, ctx, BinaryOps.MUL, dtype=dtypes.bool), self.nodes[1:], self.nodes[0].render(ops,ctx)) }
 
-  def global_load(self, i:int, idxs:Sequence[Node], acc=None) -> List[UOp]:
-    const = self.bufs[i].val if isinstance(self.bufs[i], ConstBuffer) else acc
+  def global_load(self, buf_i:int, idxs:Sequence[Node], acc=None) -> List[UOp]:
+    const = self.bufs[buf_i].val if isinstance(self.bufs[buf_i], ConstBuffer) else acc
 
     def rename_var(v: VariableOrNum, expr: str): return v if isinstance(v, NumNode) else Variable(expr, v.min, v.max)
 
     amt, dim = 1, None
-    upcast_dim = self.get_upcast_dim(i)
-    if len(upcast_dim) == 1 and len(float4_expand := idxs[upcast_dim[0]].expand()) in [4,2]:
+    upcast_dim = self.get_upcast_dim(buf_i)
+    if upcast_dim and len(upcast_dim) == 1 and len(float4_expand := idxs[upcast_dim[0]].expand()) in [4,2]:
       dim, amt = upcast_dim[0], len(float4_expand)
 
+    st_i = self.buf_i_to_st_i(buf_i)
     expand_vars = tuple([rename_var(idx.expand_idx(), f"_uidx{j}") for j, idx in enumerate(idxs)])
     fake_idxs = [idx.substitute({idx.expand_idx(): ev}) for idx, ev in zip(idxs, expand_vars)]
     if dim is not None:
-      g_idx, g_valid = self.sts[i].expr_idxs(fake_idxs[:dim] + [float4_expand[0]] + fake_idxs[dim+1:])
+      g_idx, g_valid = self.sts[st_i].expr_idxs(fake_idxs[:dim] + [float4_expand[0]] + fake_idxs[dim+1:])
       if (g_idx // amt * amt).render() != g_idx.render():
-        (g_idx, g_valid), amt, dim = self.sts[i].expr_idxs(fake_idxs), 1, None
+        (g_idx, g_valid), amt, dim = self.sts[st_i].expr_idxs(fake_idxs), 1, None
     else:
-      g_idx, g_valid = self.sts[i].expr_idxs(fake_idxs)
+      g_idx, g_valid = self.sts[st_i].expr_idxs(fake_idxs)
     localtype = dtypes.float32 if amt == 1 else dtypes._float4 if amt == 4 else dtypes._float2
 
     e_idxs, e_valids = g_idx.expand(expand_vars), g_valid.expand(expand_vars)
 
     ret = []
-    invalid_value = 0 if dtypes.is_int(self.bufs[i].dtype) else 0.0
+    invalid_value = 0 if dtypes.is_int(self.bufs[buf_i].dtype) else 0.0
     for idx, valid, rep_idx in zip(e_idxs, e_valids, Node.iter_idxs(expand_vars)):
       this_const, idx, valid = (invalid_value, Variable.num(0), Variable.num(1)) if valid.max == 0 else (const, idx, valid)
-      key = f"{acc}{localtype}{this_const if this_const is not None and acc is None else (self.bufs[i].idx if isinstance(self.bufs[i], MemBuffer) else self.bufs[i].name)}{idx.render()}{valid.render()}"
+      key = f"{acc}{localtype}{this_const if this_const is not None and acc is None else (self.bufs[buf_i].idx if isinstance(self.bufs[buf_i], MemBuffer) else self.bufs[buf_i].name)}{idx.render()}{valid.render()}"
       if key not in self.load_cache:
         if acc is not None:
           assert valid.min == 1
@@ -96,10 +97,10 @@ class Linearizer(OptimizedKernel):
             valid_rendered = valid.render(self.render_ops, self)
             self.load_cache[key] = self.uop(UOps.ALU, localtype, (valid_rendered, self.load_cache[key], self.const(invalid_value, localtype)), TernaryOps.WHERE)
         else:
-          buf_uop = self.buf_uops[i]
-          assert buf_uop is not None, f"buffer {i} wasn't UOped"
-          if isinstance(self.bufs[i].dtype, ImageDType):
-            idx, valid = to_image_idx(self.bufs[i].dtype.shape, idx, valid)
+          buf_uop = self.buf_uops[buf_i]
+          assert buf_uop is not None, f"buffer {buf_i} wasn't UOped"
+          if isinstance(self.bufs[buf_i].dtype, ImageDType):
+            idx, valid = to_image_idx(self.bufs[buf_i].dtype.shape, idx, valid)
             rendered_idx = self.uop(UOps.CAST, dtypes._int2, (idx[0].render(self.render_ops, self), idx[1].render(self.render_ops, self)))
           else:
             rendered_idx = idx.render(self.render_ops, self)
@@ -349,7 +350,8 @@ class Linearizer(OptimizedKernel):
         self.load_cache.clear()
 
     # load latebufs
-    loaded_buffers.update({b:self.global_load(i, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs) for i,b in enumerate(self.bufs) if b not in self.earlybufs and i != 0 and b.__class__ is not LocalBuffer})
+    loaded_buffers.update({b:self.global_load(i, global_idxs+local_idxs+fake_reduce_idxs+upcast_idxs) for i,b in enumerate(self.bufs) if b not in self.earlybufs and i != 0 and b.__class__ is not LocalBuffer and not (hasattr(b, 'direct') and b.direct)})
+    loaded_buffers.update({b:[cast(UOp, self.buf_uops[i])] for i,b in enumerate(self.bufs) if (hasattr(b, 'direct') and b.direct)})
 
     # run late AST
     val = self.ast_parse(self.ast, acc, loaded_buffers)
@@ -374,7 +376,7 @@ class Linearizer(OptimizedKernel):
 
     return self
 
-  def uop(self, uop:UOps, dtype:Optional[DType], vin:Tuple[UOp, ...], arg:Any=None, cachable=True) -> UOp:
+  def uop(self, uop:UOps, dtype:Optional[DType], vin:Tuple[UOp, ...], arg:Any=None, cachable=True, qm_bits=None) -> UOp:
     key = (uop, dtype, vin, arg)
     if uop == UOps.STORE and len(vin) == 2 and vin[0] == vin[1]: return vin[0]   # self store is noop
     if uop == UOps.CAST and all(x.uop == UOps.GEP for x in vin) and all_same([x.vin[0] for x in vin]) and all(x.arg == i for i,x in enumerate(vin)): return vin[0].vin[0]
@@ -391,6 +393,7 @@ class Linearizer(OptimizedKernel):
         if arg == BinaryOps.MUL and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[x]
       if arg == BinaryOps.SUB and vin[1].uop == UOps.CONST and vin[1].arg == 0.0: return vin[0]
       if arg == BinaryOps.DIV and vin[1].uop == UOps.CONST and vin[1].arg == 1.0: return vin[0]
+      if arg == TernaryOps.QUANT_MAP: arg = (arg, qm_bits)
     if cachable and key in self.saved_exprs: return self.saved_exprs[key]
     self.uops.append(UOp(uop, dtype, vin, arg, len(self.uops)))
     if DEBUG >= 5: print(self.uops[-1])
@@ -408,11 +411,12 @@ class Linearizer(OptimizedKernel):
     if x.op == ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op == UnaryOps.CAST and x.src[0].src[0].__class__ is LazyOp and x.src[0].src[0].op == BinaryOps.MUL:
       x = LazyOp(TernaryOps.MULACC, x.src[0].src[0].src, x.arg)
     values = [self.ast_parse(v, acc, loaded_buffers) for v in x.src]
+    if x.op == TernaryOps.QUANT_MAP: values = values[:-1] + [(values[-1]*len(values[0]))]
     ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, TernaryOps.MULACC:TernaryOps.MULACC}
     if x.op in ops:
       ret = [(idx, self.uop(UOps.STORE, dtypes.float32, (val[-1], self.uop(UOps.ALU, dtypes.float32, val, ops[x.op], cachable=False)))) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values, acc))]
     else:
-      ret = [(idx, self.uop(UOps.ALU, dtypes.float32, val, x.op)) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values))]
+      ret = [(idx, self.uop(UOps.ALU, dtypes.float32, val, x.op, qm_bits=x.arg)) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values))]
     ordered_ret: List[Optional[UOp]] = [None]*len(values[0])
     # scatter
     for i,j in ret:

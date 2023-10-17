@@ -22,7 +22,7 @@ class Function:
     if self.requires_grad: self.parents = tensors
 
   def forward(self, *args, **kwargs): raise NotImplementedError(f"forward not implemented for {type(self)}")
-  def backward(self, *args, **kwargs): raise RuntimeError(f"backward not implemented for {type(self)}")
+  def backward(self, *args, **kwargs): raise NotImplementedError(f"backward not implemented for {type(self)}")
 
   @classmethod
   def apply(fxn:Type[Function], *x:Tensor, **kwargs) -> Tensor:
@@ -47,7 +47,7 @@ class Tensor:
 
   no_grad: ClassVar[bool] = False
   default_type: ClassVar[DType] = dtypes.float32
-  def __init__(self, data:Union[int, float, list, LazyBuffer, np.ndarray], device:Optional[str]=None, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None):
+  def __init__(self, data:Union[int, float, list, LazyBuffer, np.ndarray], device:Optional[str]=None, dtype:Optional[DType]=None, requires_grad:Optional[bool]=None, quant_info=None):
     assert dtype is None or isinstance(dtype, DType), f"invalid dtype {dtype}"
     device = Device.canonicalize(device)
     # tensors have gradients, buffers do not
@@ -134,6 +134,27 @@ class Tensor:
     ret = Tensor(self.lazydata, device)
     if self.grad: ret.grad = self.grad.to(device)
     return ret
+  
+  def temporary(self) -> Tensor:
+    assert self.lazydata.realized is None, f"cannot turn a realized tensor into temporary"
+    self.lazydata.temporary = True
+    return self
+
+  def apply_quant_map(self, quant_map: Tensor, target_shape: Optional[Tuple[sint, ...]]=None) -> Tensor:
+    assert self.dtype == dtypes.uint16, f"only uint16 is allowed while we figure out how to load as unit instead of float"
+    # assert self.dtype in (options:=(dtypes.uint16, dtypes.uint32, dtypes.uint64)), f"cannot dequantize dtype {self.dtype}, options are {options}"
+
+    in_shape, map_shape = self.shape, quant_map.shape
+    assert len(map_shape) == 1 and ((bits:=math.ceil(math.log2(map_shape[0]))) == math.floor(math.log2(map_shape[0]))), f"quantization map must be flat and power of 2 size, got {map_shape}"
+    loop = (self.dtype.itemsize*8) // bits
+    assert loop > 1, f"source dtype ({self.dtype}: {self.dtype.itemsize*8} bits) must be >= 2x larger than mapping bits ({bits})"
+
+    middle_shape = in_shape+(loop,)
+    quant_data = self.reshape(in_shape+(1,)).expand(middle_shape).reshape(in_shape[:-1]+(-1,))
+    index_data = Tensor.arange(loop, dtype=dtypes.uint8).reshape([1]*len(middle_shape[:-1])+[loop,]).expand(middle_shape).reshape(in_shape[:-1]+(-1,))
+    quant_map.lazydata.direct = True
+    out = mlops.QuantMap.apply(quant_data, index_data, quant_map, bits=bits).temporary()
+    return out if target_shape is None else out.reshape(target_shape).temporary()
 
   # ***** creation llop entrypoint *****
 
