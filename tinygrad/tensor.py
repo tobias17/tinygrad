@@ -392,6 +392,7 @@ class Tensor:
     dim = (dim + len(self.shape)) if dim < 0 else dim
     assert all(len(y.shape) == len(self.shape) and all(y.shape[i] == s for i,s in enumerate(self.shape) if i != dim) for y in args)
     catargs = [self, *args]
+    assert all(not a.lazydata.direct for a in catargs), "cannot cat tensors with direct buffers as input"
     assert all(t.shape for t in catargs), "zero-dimensional tensor cannot be concatenated"
     shapes = [s.shape[dim] for s in catargs]
     shape_cumsum = [0, *accumulate(shapes)]

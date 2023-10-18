@@ -18,6 +18,8 @@ from tinygrad.ops import GlobalCounters
 from tinygrad.jit import TinyJit, JIT_SUPPORTED_DEVICE
 from tinygrad.shape.symbolic import Variable, sym_infer
 
+from extra.quantize import quantize_k_means_sliced
+
 JIT = getenv("JIT", 0 if CI else Device.DEFAULT in JIT_SUPPORTED_DEVICE)
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
@@ -248,13 +250,13 @@ MODEL_PARAMS = {
 }
 
 # **** helper functions ****
-def concat_weights(models):
+def concat_weights(models, to_device=True):
   def convert(name) -> Tensor:
     disk_tensors = [model[name] for model in models]
     if len(disk_tensors) == 1 or len(disk_tensors[0].shape) == 1:
-      return disk_tensors[0].to(device=Device.DEFAULT)
+      return disk_tensors[0].to(device=Device.DEFAULT) if to_device else disk_tensors[0]
     axis = 1 if name.startswith("tok_embeddings.") or name.endswith(".attention.wo.weight") or name.endswith(".feed_forward.w2.weight") else 0
-    lazy_tensors = [data.to(device=Device.DEFAULT) for data in disk_tensors]
+    lazy_tensors = [data.to(device=Device.DEFAULT) for data in disk_tensors] if to_device else disk_tensors
     return lazy_tensors[0].cat(*lazy_tensors[1:], dim=axis)
   return {name: convert(name) for name in {name: None for model in models for name in model}}
 
@@ -322,7 +324,9 @@ class LLaMa:
     if quantize:
       weights = AbsmaxQuantizedLinear.quantize(weights)
       for _,v in weights.items(): v.realize()
-    load_state_dict(model, weights, strict=False)
+    
+    # load_state_dict(model, weights, strict=False)
+    quantize_k_means_sliced(model, weights, bits=4, cache_dirpath=f"{model_path}/qcache")
 
     return LLaMa(model, sp_model)
 

@@ -3,7 +3,11 @@ from tinygrad.helpers import dtypes, prod, DEBUG
 from extra.utils import get_child, mem_to_string
 import numpy as np
 from sklearn.cluster import KMeans
-from typing import Dict, Any, Callable
+from typing import Dict, Any, Callable, Optional
+from tqdm import tqdm, trange
+import pickle
+import time
+import os
 
 QUANTIZE_COUNT = -1
 
@@ -152,3 +156,97 @@ def quantize_k_means(
     print(f"Skips | {mem_to_string(skipped_mem)} | {f'{100.0*skipped_mem/total_size:.2f}': >5}% | {mem_to_string(skipped_mem)} | {f'{0.0:.2f}': >5}% |")
     print(f"Quant | {mem_to_string(quant_mem_orig)} | {f'{100.0*quant_mem_orig/total_size:.2f}': >5}% | {mem_to_string(quant_mem_comp)} | {f'{quant_red:.2f}': >5}% |")
     print(f"Total | {mem_to_string(total_size)} | 100.0% | {mem_to_string(skipped_mem+quant_mem_comp)} | {f'{total_red:.2f}': >5}% |")
+
+
+
+def quantize_k_means_sliced(
+  mdl:Tensor, state_dict:Dict[str, Any], # from model
+  bits:int, max_chunk_size:int=4e5, cache_dirpath:Optional[str]=None, check_values:bool=False, check_composition:bool=False, # from caller through kwargs
+  skip_load_fxn:SkipLoadFxn_t=lambda k, o, d: False, skip_quant_fxn:SkipQuantFxn_t=lambda k, o, d: False, assign_fxn:AssignFxn_t=lambda o, d: o.assign(d), # optional overwrites for model
+):
+  assert bits >= 2 and bits <= 8, f"bits must be between 2 and 8, got {bits}"
+
+  N = 2**bits
+  store_dtype = dtypes.uint16
+  loop = (store_dtype.itemsize*8 // bits)
+  orig_size = 0
+  count = 0
+
+  # Determine which elements can be quantized
+  for k, v in state_dict.items():
+    obj = get_child(mdl, k)
+    dat = v.detach().numpy()
+
+    if skip_load_fxn(k, obj, dat):
+      continue
+    orig_size += prod(dat.shape)
+
+    if skip_quant_fxn(k, obj, dat) or (QUANTIZE_COUNT >= 0 and count >= QUANTIZE_COUNT):
+      assign_fxn(obj, dat)
+    elif prod(dat.shape) % loop != 0:
+      if DEBUG >= 1: print(f"Skipping quantizing {k}, prod({dat.shape})={prod(dat.shape)}, loop={loop}, {prod(dat.shape)}%{loop}={prod(dat.shape) % loop}")
+      assign_fxn(obj, dat)
+    elif True:
+      qinfo = []
+      cache_filepath = None
+      if cache_dirpath is not None:
+        if not os.path.exists(cache_dirpath):
+          os.makedirs(cache_dirpath)
+        cache_filepath = f"{cache_dirpath}/q{bits}.{k}"
+        if os.path.exists(cache_filepath):
+          with open(cache_filepath, 'rb') as f:
+            qinfo = pickle.load(f)
+
+      if len(qinfo) == 0:
+        flat = dat.flatten() 
+        chunk_count = 1
+        chunk_size  = flat.shape[0]
+        while chunk_size > max_chunk_size:
+          chunk_count *= 2
+          chunk_size = chunk_size // 2
+          assert chunk_size * chunk_count == flat.shape[0]
+          assert chunk_size % loop == 0
+
+        for i in trange(chunk_count):
+          X = flat[i*chunk_size:(i+1)*chunk_size].reshape((-1, 1,))
+          kmeans = KMeans(N, n_init='auto')
+          kmeans.fit(X)
+
+          cluster = np.array(kmeans.cluster_centers_, dtype=X.dtype).reshape(-1)
+
+          sz = X.shape[0]
+          labels = np.array(kmeans.labels_, dtype=np.uint16)
+          qdat = np.zeros((sz//loop,), dtype=store_dtype.np)
+          for i in range(loop):
+            qdat[:] |= (labels[i:i+sz:loop] << ((i%loop)*bits))
+          qinfo.append((qdat, cluster,))
+        
+        if cache_filepath is not None:
+          with open(cache_filepath, 'wb') as f:
+            pickle.dump(qinfo, f)
+      
+      tensors = []
+      for qdat, cluster in qinfo:
+        cluster_t = Tensor(cluster, dtype=dtypes.from_np(cluster.dtype))
+        qt = Tensor(qdat, dtype=store_dtype).apply_quant_map(cluster_t).add(1).temporary().sub(1).temporary()
+        tensors.append(qt)
+      
+      tensor = tensors[0].cat(*tensors[1:]).temporary() if len(tensors) > 1 else tensors[0]
+      tensor = tensor.reshape(dat.shape).temporary()
+      tensor.realize().lazydata.cleanse()
+      assign_fxn(obj, tensor)
+    else:
+      X = dat.reshape((-1, 1,))
+      kmeans = KMeans(N, n_init='auto')
+      kmeans.fit(X)
+
+      cluster_t = Tensor(kmeans.cluster_centers_.reshape(-1), dtype=dtypes.from_np(X.dtype))
+
+      sz = X.shape[0]
+      labels = np.array(kmeans.labels_, dtype=np.uint16)
+      qdat = np.zeros((sz//loop,), dtype=store_dtype.np)
+      for i in range(loop):
+        qdat[:] |= (labels[i:i+sz:loop] << ((i%loop)*bits))
+      qt = Tensor(qdat, dtype=store_dtype).apply_quant_map(cluster_t, target_shape=dat.shape)
+      qt.realize().lazydata.cleanse()
+      assign_fxn(obj, qt)
