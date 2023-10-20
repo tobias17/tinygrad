@@ -124,6 +124,13 @@ class Div(Function):
     return grad_output.e(BinaryOps.DIV, self.y) if self.needs_input_grad[0] else None, \
            grad_output.e(UnaryOps.NEG).e(BinaryOps.MUL, self.x).e(BinaryOps.DIV, self.y.e(BinaryOps.MUL, self.y)) if self.needs_input_grad[1] else None
 
+class QuantMap(Function):
+  def forward(self, x:LazyBuffer, y:LazyBuffer, qm:LazyBuffer, bits:int) -> LazyBuffer:
+    self.x, self.y = x, y
+    return x.e(BinaryOps.QUANT_MAP, y, arg=(qm,bits,))
+
+  def backward(self, grad_output:LazyBuffer): assert False, "cannot go backwards through a quantization mapping"
+
 # ************* ternary ops *************
 
 class Where(Function):

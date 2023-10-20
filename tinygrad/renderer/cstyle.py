@@ -160,11 +160,17 @@ def uops_to_cstyle(lang:CStyleLanguage, function_name:str, uops:List[UOp]) -> Tu
         raise NotImplementedError(f"WMMA not implemented for {args}")
     elif uop == UOps.ALU:
       assert dtype is not None
+      if args[0] == BinaryOps.QUANT_MAP:
+        src, idx, qm, bits = r[vin[0]], r[vin[1]], args[1], args[2]
+        val = f"(float){qm}[((unsigned int){src})>>(((unsigned int){idx})*{bits})&{hex(sum([1<<i for i in range(bits)]))}]"
+        # val = f"(((unsigned int){src})>>(((unsigned int){idx})*{bits})&{hex(sum([1<<i for i in range(bits)]))})"
+        # val = f"{qm}[0]["
+        # val = "qm1[0]"
       # remove parens if ALU types are the same. TODO: can do more here
-      if vin[0].uop == UOps.ALU and vin[0].arg == args and args in {BinaryOps.ADD, BinaryOps.SUB, BinaryOps.MUL}:
-        val = lang.code_for_op[args](strip_parens(r[vin[0]]), *[r[x] for x in vin[1:]])
+      elif vin[0].uop == UOps.ALU and vin[0].arg == args[0] and args[0] in {BinaryOps.ADD, BinaryOps.SUB, BinaryOps.MUL}:
+        val = lang.code_for_op[args[0]](strip_parens(r[vin[0]]), *[r[x] for x in vin[1:]])
       else:
-        val = lang.code_for_op[args](*[r[x] for x in vin])
+        val = lang.code_for_op[args[0]](*[r[x] for x in vin])
       assert child_count[u] != 0, f"childless ALU op found {u}"
       if child_count[u] <= 1 or dtypes.is_int(dtype):  # fix index rendering issue
         r[u] = val

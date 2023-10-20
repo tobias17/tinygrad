@@ -5,8 +5,7 @@ from collections import defaultdict
 from enum import Enum, auto
 
 from tinygrad.helpers import colored, ImageDType, DEBUG, dtypes, DType, prod, PtrDType, all_same
-from tinygrad.ops import LazyOp, UnaryOps, ConstBuffer, MemBuffer, BufferOps
-from tinygrad.ops import ReduceOps, BinaryOps, TernaryOps
+from tinygrad.ops import LazyOp, UnaryOps, ConstBuffer, MemBuffer, BufferOps, ReduceOps, BinaryOps, TernaryOps
 from tinygrad.shape.shapetracker import ShapeTracker
 from tinygrad.shape.symbolic import Variable, NumNode, VariableOrNum, Node, SumNode, MulNode, DivNode, ModNode, LtNode, AndNode, sym_rename
 from tinygrad.codegen.optimizer import OptimizedKernel
@@ -48,7 +47,7 @@ def get_grouped_dims(prefix, start_dim, local_dims, maxdim:int=0):
 class Linearizer(OptimizedKernel):
   def uop_alu_idx(self, a:UOp, b, ops, ctx:Linearizer, op, dtype=dtypes.int32):
     render_b:UOp = cast(UOp, (NumNode(b) if not isinstance(b, Node) else b).render(ops, ctx))
-    return self.uop(UOps.ALU, dtype, (a, render_b), op)
+    return self.uop(UOps.ALU, dtype, (a, render_b), (op,))
   def const(self, b:Union[int,float], dtype=dtypes.int32) -> UOp: return self.uop(UOps.CONST, dtype, tuple(), b)
 
   render_ops: Any = { Variable: lambda self, ops, ctx: ctx.loop_uops[self.expr], NumNode: lambda self, ops, ctx: ctx.const(self.b),
@@ -94,7 +93,7 @@ class Linearizer(OptimizedKernel):
           self.load_cache[key] = self.const(this_const, localtype)
           if valid.min == 0 and valid.max == 1:
             valid_rendered = valid.render(self.render_ops, self)
-            self.load_cache[key] = self.uop(UOps.ALU, localtype, (valid_rendered, self.load_cache[key], self.const(invalid_value, localtype)), TernaryOps.WHERE)
+            self.load_cache[key] = self.uop(UOps.ALU, localtype, (valid_rendered, self.load_cache[key], self.const(invalid_value, localtype)), (TernaryOps.WHERE,))
         else:
           buf_uop = self.buf_uops[i]
           assert buf_uop is not None, f"buffer {i} wasn't UOped"
@@ -391,16 +390,16 @@ class Linearizer(OptimizedKernel):
     if uop == UOps.GEP and vin[0].uop == UOps.CONST: return self.const(vin[0].arg, dtype)
     if uop == UOps.ALU:
       # rewrites. NOTE: the rewritten NEG op is still around...
-      if arg == BinaryOps.ADD and vin[1].uop == UOps.ALU and vin[1].arg == UnaryOps.NEG: return self.uop(UOps.ALU, dtype, (vin[0], vin[1].vin[0]), BinaryOps.SUB, cachable=cachable)
+      if arg[0] == BinaryOps.ADD and vin[1].uop == UOps.ALU and vin[1].arg[0] == UnaryOps.NEG: return self.uop(UOps.ALU, dtype, (vin[0], vin[1].vin[0]), (BinaryOps.SUB,), cachable=cachable)
       # constant folding
-      if arg == UnaryOps.NEG and vin[0].uop == UOps.CONST: return self.const(-vin[0].arg, dtype)
+      if arg[0] == UnaryOps.NEG and vin[0].uop == UOps.CONST: return self.const(-vin[0].arg[0], dtype)
       # zero folding
       for x in [0,1]:
-        if arg == BinaryOps.ADD and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[1-x]
-        if arg == BinaryOps.MUL and vin[x].uop == UOps.CONST and vin[x].arg == 1.0: return vin[1-x]
-        if arg == BinaryOps.MUL and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[x]
-      if arg == BinaryOps.SUB and vin[1].uop == UOps.CONST and vin[1].arg == 0.0: return vin[0]
-      if arg == BinaryOps.DIV and vin[1].uop == UOps.CONST and vin[1].arg == 1.0: return vin[0]
+        if arg[0] == BinaryOps.ADD and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[1-x]
+        if arg[0] == BinaryOps.MUL and vin[x].uop == UOps.CONST and vin[x].arg == 1.0: return vin[1-x]
+        if arg[0] == BinaryOps.MUL and vin[x].uop == UOps.CONST and vin[x].arg == 0.0: return vin[x]
+      if arg[0] == BinaryOps.SUB and vin[1].uop == UOps.CONST and vin[1].arg == 0.0: return vin[0]
+      if arg[0] == BinaryOps.DIV and vin[1].uop == UOps.CONST and vin[1].arg == 1.0: return vin[0]
     if cachable and key in self.saved_exprs: return self.saved_exprs[key]
     self.uops.append(UOp(uop, dtype, vin, arg, len(self.uops)))
     if DEBUG >= 5: print(self.uops[-1])
@@ -418,11 +417,20 @@ class Linearizer(OptimizedKernel):
     if x.op == ReduceOps.SUM and x.src[0].__class__ is LazyOp and x.src[0].op == UnaryOps.CAST and x.src[0].src[0].__class__ is LazyOp and x.src[0].src[0].op == BinaryOps.MUL:
       x = LazyOp(TernaryOps.MULACC, x.src[0].src[0].src, x.arg)
     values = [self.ast_parse(v, acc, loaded_buffers) for v in x.src]
+    # if x.op == BinaryOps.QUANT_MAP: values += []
     ops = {ReduceOps.SUM:BinaryOps.ADD, ReduceOps.MAX:BinaryOps.MAX, TernaryOps.MULACC:TernaryOps.MULACC}
     if x.op in ops:
-      ret = [(idx, self.uop(UOps.STORE, dtypes.float32, (val[-1], self.uop(UOps.ALU, dtypes.float32, val, ops[x.op], cachable=False)))) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values, acc))]
+      ret = [(idx, self.uop(UOps.STORE, dtypes.float32, (val[-1], self.uop(UOps.ALU, dtypes.float32, val, (ops[x.op],), cachable=False)))) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values, acc))]
     else:
-      ret = [(idx, self.uop(UOps.ALU, dtypes.float32, val, x.op)) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values))]
+      if x.op == BinaryOps.QUANT_MAP:
+        if x.arg[0] is str: pass
+        elif (qm_buf:=loaded_buffers.get(x.arg[0])) is not None: x.arg = (qm_buf.arg[0], *x.arg[1:])
+        else:
+          reg = f"qm{self.qm_idx}"
+          loaded_buffers[x.arg[0]] = self.uop(UOps.DEFINE_GLOBAL, x.arg[0].dtype, (), arg=(reg, x.arg[0].dtype,))
+          x.arg = (reg, *x.arg[1:])
+          self.qm_idx = self.qm_idx+1
+      ret = [(idx, self.uop(UOps.ALU, dtypes.float32, val, (x.op,*(x.arg if x.arg else [])))) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values))]
     ordered_ret: List[Optional[UOp]] = [None]*len(values[0])
     # scatter
     for i,j in ret:

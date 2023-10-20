@@ -13,7 +13,7 @@ from dataclasses import dataclass
 # NOTE: MOD, CMPLT don't have to be implemented on vectors, just scalars
 # NOTE: rdna3 only has RECIP and not DIV. DIV and POW are on the chopping block
 class UnaryOps(Enum): NOOP = auto(); EXP2 = auto(); LOG2 = auto(); CAST = auto(); SIN = auto(); SQRT = auto(); RECIP = auto(); NEG = auto() # noqa: E702
-class BinaryOps(Enum): ADD = auto(); SUB = auto(); MUL = auto(); DIV = auto(); MAX = auto(); MOD = auto(); CMPLT = auto() # noqa: E702
+class BinaryOps(Enum): ADD = auto(); SUB = auto(); MUL = auto(); DIV = auto(); MAX = auto(); MOD = auto(); CMPLT = auto(); QUANT_MAP = auto() # noqa: E702
 class TernaryOps(Enum): MULACC = auto(); WHERE = auto() # noqa: E702
 class ReduceOps(Enum): SUM = auto(); MAX = auto() # noqa: E702
 class BufferOps(Enum): MEM = auto(); CONST = auto() # noqa: E702
@@ -65,6 +65,7 @@ class LazyOp:
   @property
   def key(self): return (self.op, tuple(map(lambda x: getattr(x, "key", x), self.src)), getattr(self.arg, "key", self.arg))
 
+  def get_direct_buffers(self): return ([self.arg[0]] if self.op == BinaryOps.QUANT_MAP else []) + [item for x in self.src for item in x.get_direct_buffers()]
   def map_buffers(self, real_srcs: Mapping[Any, Union[LazyBuffer, LazyOp]]) -> LazyOp: return LazyOp(self.op, tuple([y.map_buffers(real_srcs) if y not in real_srcs else real_srcs[y] for y in self.src]), self.arg)
   def get_lazyops(self) -> List[LazyOp]: return [self] + [item for x in self.src for item in x.get_lazyops()]
 
@@ -155,9 +156,11 @@ shape_fxn_for_op: Dict[Op, Callable] = {
   BufferOps.MEM: lambda arg: (arg.st.shape, arg.dtype, 0), BufferOps.CONST: lambda arg: (arg.st.shape, arg.dtype, 0),
   UnaryOps.CAST: lambda self,arg: (self.shape, arg[0], self.consume_flops()),   # cast uses no flops
   **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op != UnaryOps.CAST},
-  **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps},
+  **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps if op != BinaryOps.QUANT_MAP},
   **{op:lambda self,new_shape: (new_shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in ReduceOps},
+  BinaryOps.QUANT_MAP: lambda self,y,a: (self.shape, a[0].dtype, self.consume_flops() + y.consume_flops() + prod(self.shape)),
   TernaryOps.WHERE: lambda self,y,z: (self.shape, y.dtype, self.consume_flops() + y.consume_flops() + z.consume_flops() + prod(self.shape))}
+assert BinaryOps.QUANT_MAP in shape_fxn_for_op
 InterpretedFlopCounter = Interpreted(FlopCounter, shape_fxn_for_op, lambda x: x)
 def get_lazyop_info(ast:LazyOp) -> FlopCounter: return InterpretedFlopCounter.exec_ast(ast)
 
@@ -286,6 +289,7 @@ class Compiled:
       prg = get_program()
 
     if prg.name == getenv("PRINT_PRG", ''): print(prg.prg)
+    # print(prg.prg)
 
     prg.exec(rawbuffers, var_vals={k:var_vals[k] for k in ast_vars})
     return output.realized

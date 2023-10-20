@@ -135,6 +135,14 @@ class Tensor:
     if self.grad: ret.grad = self.grad.to(device)
     return ret
 
+  def mark_temp(self) -> Tensor:
+    self.lazydata.temp = True
+    return self
+
+  def fill_temp(self, flood=False) -> Tensor:
+    self.lazydata.fill_temp(flood)
+    return self
+
   # ***** creation llop entrypoint *****
 
   @staticmethod
@@ -564,6 +572,21 @@ class Tensor:
     return (x*w).sum(-1)
 
   def cumsum(self, axis:int=0) -> Tensor: return self.transpose(axis,-1).pad2d((self.shape[axis]-1,0))._pool((self.shape[axis],)).sum(-1).transpose(axis,-1)
+
+  def apply_quant_map(self, quant_map: Tensor, target_shape: Optional[Tuple[sint, ...]]=None) -> Tensor:
+    assert self.dtype == dtypes.uint16, f"only uint16 is allowed while we figure out how to load as unit instead of float"
+    # assert self.dtype in (options:=(dtypes.uint16, dtypes.uint32, dtypes.uint64)), f"cannot dequantize dtype {self.dtype}, options are {options}"
+
+    in_shape, map_shape = self.shape, quant_map.shape
+    assert len(map_shape) == 1 and ((bits:=math.ceil(math.log2(map_shape[0]))) == math.floor(math.log2(map_shape[0]))), f"quantization map must be flat and power of 2 size, got {map_shape}"
+    loop = (self.dtype.itemsize*8) // bits
+    assert loop > 1, f"source dtype ({self.dtype}: {self.dtype.itemsize*8} bits) must be >= 2x larger than mapping bits ({bits})"
+
+    middle_shape = in_shape+(loop,)
+    quant_data = self.reshape(in_shape+(1,)).expand(middle_shape).reshape(in_shape[:-1]+(-1,))
+    index_data = Tensor.arange(loop, dtype=dtypes.uint8).reshape([1]*len(middle_shape[:-1])+[loop,]).expand(middle_shape).reshape(in_shape[:-1]+(-1,))
+    out = mlops.QuantMap.apply(quant_data, index_data, qm=quant_map.lazydata, bits=bits).mark_temp()
+    return out if target_shape is None else out.reshape(target_shape).fill_temp()
 
   # ***** mlops (unary) *****
 

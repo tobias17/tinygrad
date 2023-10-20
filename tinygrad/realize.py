@@ -9,12 +9,20 @@ from tinygrad.runtime.lib import RawBufferMapped, RawBufferTransfer
 from tinygrad.runtime.ops_disk import RawDiskBuffer
 from tinygrad.features.image import fix_schedule_for_images
 
+from tqdm import tqdm
+import time
+
 def run_schedule(schedule:List[ScheduleItem], disable_logging=False):
   # HACK: images can be not usable due to shape
   if IMAGE >= 2: schedule = fix_schedule_for_images(schedule)
+  cc = 0
+  
+  pbar = tqdm(total=len(schedule)) if len(schedule) > 127 else None
+  # print(len([0 for si in schedule if si.ast.op == LoadOps.FROM]))
 
   # NOTE: if you for loop the schedule it's slow because nothing frees
   while len(schedule):
+    if pbar: pbar.update(1)
     si = schedule.pop(0)
     if not disable_logging: log_schedule_item(si)
     assert all(x.realized for x in si.inputs), "can't run schedule, some inputs aren't realized"
@@ -25,10 +33,16 @@ def run_schedule(schedule:List[ScheduleItem], disable_logging=False):
       LOAD_OPS_DISPATCHER[cast(LoadOps, si.ast.op)](si.out, *si.inputs)
     else:
       si.out.realized = Device[si.out.device].exec_ast(si.ast, output=si.out, inputs=si.inputs, var_vals=si.var_vals, **si.out._device_extra_args())
-    del si.out.op
-    for v in si.out.views: del v.op
+      for b in si.inputs:
+        if b.temp:
+          b.cleanse() # FIXME: this needs more checks
+          cc += 1
+    if not si.out.temp: del si.out.op
+    for v in si.out.views:
+      if not v.temp: del v.op
     assert si.out.realized and isinstance(si.out.realized, Device[si.out.device].buffer), f"device mismatch on realized got {type(si.out.realized)} expected {si.out.device}"
     assert si.out.realized.dtype == si.out.dtype, "realized dtype is incorrect"
+  # print(f"cleansed {cc} roots")
 
 # *** zero op LoadOps ***
 

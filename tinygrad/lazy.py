@@ -61,18 +61,20 @@ def _ast_binaryops(op:LazyOp, shape: Tuple[sint, ...]) -> LazyOp:
   ast = op.map_buffers(cast(Dict[LazyBuffer, Union[LazyOp, LazyBuffer]], real_srcs))
   return LazyOp(MovementOps.RESHAPE, (ast, ), shape) if intermediate_shape != shape else ast
 
-def _replace_bufferops(op:LazyOp) -> Tuple[LazyOp, List[LazyBuffer]]:
+def _replace_bufferops(op:LazyOp) -> Tuple[LazyOp, List[LazyBuffer], List[LazyBuffer]]:
   replacements:Dict[LazyBuffer, LazyOp] = {}
-  base_bufs = dedup([x.base for x in op.buffers if not x.is_unrealized_const()])
-  for x in op.buffers:
+  direct_bufs = dedup(op.get_direct_buffers())
+  base_bufs = dedup([x.base for x in op.buffers if not x.is_unrealized_const()]) + direct_bufs
+
+  for x, direct in [(b, False) for b in op.buffers] + [(b, True) for b in direct_bufs]:
     st = x.st.simplify().unbind()
-    if x.base in base_bufs:
+    if x.base in base_bufs or direct:
       replacements[x] = LazyOp(BufferOps.MEM, (), MemBuffer(base_bufs.index(x.base)+1, x.dtype, st))
     elif not x.realized and x.base.op.op == LoadOps.CONST:
       replacements[x] = LazyOp(BufferOps.CONST, (), ConstBuffer(float(x.base.op.arg), x.dtype, st))
     else:
       raise NotImplementedError(f"not handled {x}")
-  return (op.src[0] if op.op == MovementOps.RESHAPE else op).map_buffers(replacements), base_bufs
+  return (op.src[0] if op.op == MovementOps.RESHAPE else op).map_buffers(replacements), base_bufs, direct_bufs
 
 # **** lazy operations ****
 
@@ -96,7 +98,7 @@ def create_lazybuffer(device:str, st:ShapeTracker, optype:OpType, op:LazyOp, dty
   lazycache[wop] = ret = LazyBuffer(device, st, optype, op, dtype, base=base)
   return ret
 
-UNSAFE_PAD_OPS = {BinaryOps.DIV, BinaryOps.CMPLT, UnaryOps.LOG2, UnaryOps.EXP2, UnaryOps.RECIP}
+UNSAFE_PAD_OPS = {BinaryOps.DIV, BinaryOps.CMPLT, BinaryOps.QUANT_MAP, UnaryOps.LOG2, UnaryOps.EXP2, UnaryOps.RECIP}
 
 class LazyBuffer:
   __deletable__ = ('op',)
@@ -116,6 +118,7 @@ class LazyBuffer:
     self._base = base
     if base: base.views.add(self)
     else: assert st.contiguous, "unbased LazyBuffers must be contiguous"
+    self.temp = False
 
   @property
   def base(self): return self._base if self._base is not None else self
@@ -145,8 +148,20 @@ class LazyBuffer:
 
   @property
   def buffers(self) -> Tuple[LazyBuffer, ...]: return (self,)
+  def get_direct_buffers(self): return []
   def map_buffers(self, real_srcs: Mapping[Any, Union[LazyBuffer, LazyOp]]): return real_srcs.get(self, self)
   def get_lazyops(self) -> List[LazyOp]: return []
+
+  def fill_temp(self, flood=False) -> LazyBuffer: # TODO: flood does not have enough checks
+    if self.temp: return True
+    for buf in self.op.buffers:
+      self.temp = buf.fill_temp(flood) or self.temp or flood
+    return self.temp
+
+  def cleanse(self):
+    if not self.temp: return
+    self._realized = None
+    for buf in self.op.buffers: buf.cleanse()
 
   # *** scheduling ***
 
@@ -169,7 +184,8 @@ class LazyBuffer:
     var_vals = dict(sorted(merge_dicts([self.st.var_vals] + [buf.st.var_vals for buf in op.buffers]).items(), key=lambda kv:cast(Variable,kv[0]).key))
 
     # run the ast and log the op
-    op, base_bufs = _replace_bufferops(op)
+    op, base_bufs, direct_bufs = _replace_bufferops(op)
+    for dir_buf in direct_bufs: ret += dir_buf.schedule(seen)
     return ret + [ScheduleItem(op, self, tuple(base_bufs), {k:var_vals[k] for k in vars_from_ast(op)})]
 
   # *** creation/special ops ***
@@ -214,7 +230,7 @@ class LazyBuffer:
     if SHUFFLE_MOVEMENT_OPS: srcs = _push_movement_ops(srcs)
 
     # get outputs now
-    out_device, out_shape, out_dtype = srcs[0].device, srcs[0].shape, max([x.dtype for x in srcs]) if op != UnaryOps.CAST else cast(Tuple[DType, bool], arg)[0]
+    out_device, out_shape, out_dtype = srcs[0].device, srcs[0].shape, arg[0].dtype if op == BinaryOps.QUANT_MAP else max([x.dtype for x in srcs]) if op != UnaryOps.CAST else cast(Tuple[DType, bool], arg)[0]
 
     # push all contiguous to the end of BinaryOps. kernels 198 -> 196
     if PUSH_CONTIGUOUS and any(not x.realized and x.op.op == LoadOps.CONTIGUOUS and len(x.op.src[0].children) <= 1 for x in srcs):
