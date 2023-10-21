@@ -5,7 +5,7 @@ from weakref import ref, WeakSet, WeakValueDictionary
 
 import numpy as np
 from tinygrad.helpers import prod, getenv, DType, dtypes, flatten, dedup, merge_dicts
-from tinygrad.ops import ScheduleItem, UnaryOps, BinaryOps, TernaryOps, ReduceOps, MovementOps, LoadOps, OpType, LazyOp, MemBuffer, ConstBuffer, BufferOps
+from tinygrad.ops import ScheduleItem, UnaryOps, BinaryOps, TernaryOps, ReduceOps, MovementOps, LoadOps, OpType, LazyOp, MemBuffer, ConstBuffer, BufferOps, ProjectOps
 from tinygrad.shape.shapetracker import ShapeTracker, get_contraction
 from tinygrad.shape.symbolic import Variable, sint
 
@@ -203,6 +203,10 @@ class LazyBuffer:
 
   def cast(self, dtype:DType, bitcast:bool=False):
     return self.e(UnaryOps.CAST, arg=(dtype, bitcast))
+
+  # @staticmethod
+  # def cat(bufs: List[LazyBuffer], shape, offsets):# -> LazyBuffer:
+  #   return create_lazybuffer(bufs[0].device, shape, ProjectOps, LazyOp(ProjectOps.CAT, bufs, offsets), bufs[0].dtype)
 
   # *** elementwise ops ***
 

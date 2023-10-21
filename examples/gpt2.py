@@ -17,6 +17,45 @@ from tinygrad.shape.symbolic import Variable
 
 MAX_CONTEXT = 128
 
+
+
+
+
+from typing import List
+from models.resnet import ResNet50
+from tinygrad.tensor import Tensor
+from tinygrad.ops import LoadOps, Device, Compiled, get_lazyop_info
+from tinygrad.codegen.linearizer import Linearizer
+from tinygrad.features.search import time_linearizer, beam_search
+from tinygrad.helpers import ansilen, DEBUG, getenv, dtypes, prod
+from tinygrad.graph import print_tree
+from tinygrad.lazy import vars_from_ast, LazyBuffer
+from tinygrad.shape.symbolic import sym_infer
+from tinygrad.runtime.ops_cuda import renderer
+import numpy as np
+def print_program(tensor):
+  seen = set()
+  device: Compiled = Device[Device.DEFAULT]
+
+  sched = tensor.lazydata.schedule(seen)
+  sched = [x for x in sched if x.ast.op not in LoadOps]
+
+  for i,si in enumerate(sched):
+    # if i != 4: continue
+    # if DEBUG >= 2: print_tree(si.ast)
+
+    lin = Linearizer(si.ast, device.linearizer_opts)
+    lin.linearize()
+    lin.hand_coded_optimizations()
+    # print("\n".join(map(str, lin.uops)))
+    prg = renderer("test_func", lin.uops)
+
+    # print(prg[0])
+    print_tree(si.ast)
+
+
+
+
 class LayerNorm:
   def __init__(self, dim, eps=1e-5):
     self.eps = eps
@@ -53,6 +92,13 @@ class Attention:
     cache_k, cache_v = keys, values
     xq, keys, values = xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
     output = xq.scaled_dot_product_attention(keys, values, mask).transpose(1, 2).reshape(bsz, seqlen, -1)
+
+    if start_pos > 12:
+      print("\n" + "="*40 + "\n")
+      print_program(keys)
+      print(f"starting pos: {start_pos}")
+      _jfg = 0
+
     return self.c_proj(output), cache_k, cache_v
 
 class FeedForward:
@@ -128,7 +174,8 @@ class Transformer:
       h = self.embed(tokens, pos)
       for i, hi in enumerate(self.h):
         h, self.kv_caches[f'cache_k{i}'], self.kv_caches[f'cache_v{i}'] = hi(h, self.kv_caches[f'cache_k{i}'], self.kv_caches[f'cache_v{i}'], start_pos=start_pos, mask=mask)
-      for v in self.kv_caches.values(): v.realize()
+      for v in self.kv_caches.values():
+        v.realize()
       return self.postprocess(h, temperature).realize()
 
 # **** files and arguments ****

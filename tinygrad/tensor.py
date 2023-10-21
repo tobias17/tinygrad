@@ -367,6 +367,19 @@ class Tensor:
     permarg = permarg[1:dim] + [permarg[0]] + permarg[dim+1:] + [permarg[dim]] if dim != 0 else permarg[1:] + [permarg[0]]
     return ((idx == Tensor.arange(self.shape[dim], dtype=dtypes.int32, requires_grad=False, device=self.device)) * self.permute(*permarg).shrink(tuple([*[(0,sh) for sh in idx.shape[1:-1]], (0,self.shape[dim])])).unsqueeze(0)).sum(-1).transpose(ax1=0, ax2=dim)
 
+  @staticmethod
+  def better_cat(*args, dim=0):
+    assert len(args) > 0, f"cannot cat 0 items together"
+    dim = (dim + len(args[0].shape)) if dim < 0 else dim
+    assert all(len(y.shape) == len(args[0].shape) and all(y.shape[i] == s for i,s in enumerate(args[0].shape) if i != dim) for y in args)
+    assert all(t.shape for t in args), "zero-dimensional tensor cannot be concatenated"
+    shapes = [s.shape[dim] for s in args]
+    shape_cumsum = [0, *accumulate(shapes)]
+    slc = [[[0, 0] for _ in args[0].shape] for _ in args]
+    for shp,k,s in zip(shapes, shape_cumsum[:-1], slc):
+      s[dim] = [k, k+shp]
+    mlops.Cat.apply(args, slc)
+
   def cat(self, *args, dim=0):
     dim = (dim + len(self.shape)) if dim < 0 else dim
     assert all(len(y.shape) == len(self.shape) and all(y.shape[i] == s for i,s in enumerate(self.shape) if i != dim) for y in args)

@@ -157,6 +157,17 @@ class Max(Function):
     div = max_is_1s.r(ReduceOps.SUM, grad_output.shape).expand(self.x.shape)
     return max_is_1s.e(BinaryOps.DIV, div).e(BinaryOps.MUL, grad_output.expand(self.x.shape))
 
+# ************* project ops *************
+
+class Cat(Function):
+  def forward(self, *args:LazyBuffer, shape:Tuple[int, ...], slices:Tuple[int, ...]) -> LazyBuffer:
+    self.slices = slices
+    # return LazyBuffer.cat(args, shape, [s[0] for s in slices])
+    return LazyBuffer()
+
+  def backward(self, grad_output:LazyBuffer) -> LazyBuffer:
+    raise NotImplementedError()
+
 # ************* movement ops *************
 
 # NOTE: this is sum in reverse
