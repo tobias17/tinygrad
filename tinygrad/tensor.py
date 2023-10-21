@@ -577,8 +577,8 @@ class Tensor:
     assert self.dtype == dtypes.uint16, f"only uint16 is allowed while we figure out how to load as unit instead of float"
     # assert self.dtype in (options:=(dtypes.uint16, dtypes.uint32, dtypes.uint64)), f"cannot dequantize dtype {self.dtype}, options are {options}"
 
-    in_shape, map_shape = self.shape, quant_map.shape
-    assert len(map_shape) == 1 and ((bits:=math.ceil(math.log2(map_shape[0]))) == math.floor(math.log2(map_shape[0]))), f"quantization map must be flat and power of 2 size, got {map_shape}"
+    in_shape, qm_shape = self.shape, quant_map.shape
+    assert len(qm_shape) == 1 and ((bits:=math.ceil(math.log2(qm_shape[0]))) == math.floor(math.log2(qm_shape[0]))), f"quantization map must be flat and power of 2 size, got {qm_shape}"
     loop = (self.dtype.itemsize*8) // bits
     assert loop > 1, f"source dtype ({self.dtype}: {self.dtype.itemsize*8} bits) must be >= 2x larger than mapping bits ({bits})"
 

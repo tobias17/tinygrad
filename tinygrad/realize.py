@@ -17,7 +17,7 @@ def run_schedule(schedule:List[ScheduleItem], disable_logging=False):
   if IMAGE >= 2: schedule = fix_schedule_for_images(schedule)
   cc = 0
   
-  pbar = tqdm(total=len(schedule)) if len(schedule) > 127 else None
+  pbar = None # tqdm(total=len(schedule)) if len(schedule) > 127 else None
   # print(len([0 for si in schedule if si.ast.op == LoadOps.FROM]))
 
   # NOTE: if you for loop the schedule it's slow because nothing frees
