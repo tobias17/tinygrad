@@ -153,6 +153,8 @@ class GlobalCounters:
   mem_cached: ClassVar[int] = 0 # NOTE: this is not reset
   mem_used_alloc: ClassVar = collections.defaultdict(int)
   max_mem_alloc: ClassVar = collections.defaultdict(int)
+  iteration: ClassVar[int] = -1
+  kernel_times: ClassVar[List[int]] = []
 
   @staticmethod
   def reset(): GlobalCounters.global_ops, GlobalCounters.global_mem, GlobalCounters.time_sum_s, GlobalCounters.kernel_count = 0,0,0.0,0

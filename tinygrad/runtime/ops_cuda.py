@@ -3,7 +3,7 @@ from pathlib import Path
 from typing import Optional
 import numpy as np
 from pycuda.compiler import compile as cuda_compile # type: ignore
-from tinygrad.helpers import DEBUG, getenv, colored, fromimport
+from tinygrad.helpers import DEBUG, getenv, colored, fromimport, GlobalCounters
 from tinygrad.ops import Compiled
 from tinygrad.runtime.lib import RawBufferCopyInOut, RawMallocBuffer, LRUAllocator
 from tinygrad.codegen.kernel import LinearizerOptions

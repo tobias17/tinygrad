@@ -288,6 +288,10 @@ class Compiled:
     else:
       prg = get_program()
 
+    if GlobalCounters.iteration >= 0:
+      with open(f"cache/prgs_{GlobalCounters.iteration}.c", "a") as f:
+        f.write(prg.prg + "\n\n")
+
     if prg.name == getenv("PRINT_PRG", ''): print(prg.prg)
     # print(prg.prg)
 

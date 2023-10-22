@@ -69,30 +69,29 @@ def print_program(tensor):
 #   # print(f"")
 #   # print(f"int1: {val1 + (-1 if not alu0 else 0)}")
 
-def new_cat(t: List[Tensor]) -> Tensor:
-  assert len(t) > 1, f"must provide atleast 2 tensors to cat"
-  assert all(t[0].shape[:-1] == t[i].shape[:-1] for i in range(1, len(t))), f"shapes must match until the final index"
-  assert all(t[0].dtype == t[i].dtype and t[0].device == t[i].device for i in range(1, len(t))), f"all tensors must have the same dtype and device"
-  new_tensor = Tensor.zeros(*(t[0].shape[:-1]), sum([x.shape[-1] for x in t]), dtype=t[0].dtype, device=t[0].device)
-  for i in range(len(t)):
-    prev_sum = sum(map(lambda x: x.shape[-1], t[:i]))
-    start_shape = tuple((0, t[0].shape[j]) for j in range(len(t[0].shape) - 1))
-    s_t = new_tensor.shrink( start_shape + ((prev_sum, prev_sum+t[i].shape[-1],),) )
-    a_t = s_t + t[i]
-    p_t = a_t.pad(tuple((0,0) for _ in range(len(t[0].shape) - 1)) + ((prev_sum, new_tensor.shape[-1]-t[i].shape[-1]-prev_sum,),))
-    new_tensor += p_t
-  return new_tensor
+# def new_cat(t: List[Tensor]) -> Tensor:
+#   assert len(t) > 1, f"must provide atleast 2 tensors to cat"
+#   assert all(t[0].shape[:-1] == t[i].shape[:-1] for i in range(1, len(t))), f"shapes must match until the final index"
+#   assert all(t[0].dtype == t[i].dtype and t[0].device == t[i].device for i in range(1, len(t))), f"all tensors must have the same dtype and device"
+#   new_tensor = Tensor.zeros(*(t[0].shape[:-1]), sum([x.shape[-1] for x in t]), dtype=t[0].dtype, device=t[0].device)
+#   for i in range(len(t)):
+#     prev_sum = sum(map(lambda x: x.shape[-1], t[:i]))
+#     start_shape = tuple((0, t[0].shape[j]) for j in range(len(t[0].shape) - 1))
+#     s_t = new_tensor.shrink( start_shape + ((prev_sum, prev_sum+t[i].shape[-1],),) )
+#     a_t = s_t + t[i]
+#     p_t = a_t.pad(tuple((0,0) for _ in range(len(t[0].shape) - 1)) + ((prev_sum, new_tensor.shape[-1]-t[i].shape[-1]-prev_sum,),))
+#     new_tensor += p_t
+#   return new_tensor
 
 t = [Tensor([1,2,3,4]) + Tensor([1,2,3,4]) for _ in range(4)]
-
 a = t[0].cat(*t[1:])
-a = new_cat(t)
+# a = new_cat(t)
 
 # T = Tensor([float(i) for i in range(128)])
 # a = T.shrink(((24, 32,),))
 
-# print_program(a)
-print(a.numpy())
+print_program(a)
+# print(a.numpy())
 
 
 # t = []

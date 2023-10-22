@@ -3,7 +3,7 @@ import numpy as np
 from tinygrad.ops import ScheduleItem, LazyOp, LoadOps, Device, BufferOps
 from tinygrad.graph import log_schedule_item, print_tree
 from tinygrad.lazy import LazyBuffer
-from tinygrad.helpers import DEBUG, prod, all_int, getenv, IMAGE
+from tinygrad.helpers import DEBUG, prod, all_int, getenv, IMAGE, GlobalCounters
 
 from tinygrad.runtime.lib import RawBufferMapped, RawBufferTransfer
 from tinygrad.runtime.ops_disk import RawDiskBuffer
@@ -22,7 +22,7 @@ def run_schedule(schedule:List[ScheduleItem], disable_logging=False):
 
   # NOTE: if you for loop the schedule it's slow because nothing frees
   while len(schedule):
-    if pbar: pbar.update(1)
+    # if pbar: pbar.update(1)
     si = schedule.pop(0)
     if not disable_logging: log_schedule_item(si)
     assert all(x.realized for x in si.inputs), "can't run schedule, some inputs aren't realized"
@@ -43,6 +43,7 @@ def run_schedule(schedule:List[ScheduleItem], disable_logging=False):
     assert si.out.realized and isinstance(si.out.realized, Device[si.out.device].buffer), f"device mismatch on realized got {type(si.out.realized)} expected {si.out.device}"
     assert si.out.realized.dtype == si.out.dtype, "realized dtype is incorrect"
   # print(f"cleansed {cc} roots")
+
 
 # *** zero op LoadOps ***
 
