@@ -67,9 +67,9 @@ def _replace_bufferops(op:LazyOp) -> Tuple[LazyOp, List[LazyBuffer]]:
   for x in op.buffers:
     st = x.st.simplify().unbind()
     if x.base in base_bufs:
-      replacements[x] = LazyOp(BufferOps.MEM, (), MemBuffer(base_bufs.index(x.base)+1, x.dtype, st))
+      replacements[x] = LazyOp(BufferOps.MEM, (), MemBuffer(base_bufs.index(x.base)+1, x.dtype, st, x.load_dtype))
     elif not x.realized and x.base.op.op == LoadOps.CONST:
-      replacements[x] = LazyOp(BufferOps.CONST, (), ConstBuffer(float(x.base.op.arg), x.dtype, st))
+      replacements[x] = LazyOp(BufferOps.CONST, (), ConstBuffer(float(x.base.op.arg), x.dtype, st, x.load_dtype))
     else:
       raise NotImplementedError(f"not handled {x}")
   return (op.src[0] if op.op == MovementOps.RESHAPE else op).map_buffers(replacements), base_bufs
@@ -116,6 +116,8 @@ class LazyBuffer:
     self._base = base
     if base: base.views.add(self)
     else: assert st.contiguous, "unbased LazyBuffers must be contiguous"
+    self.load_dtype = False
+    self.temp = False
 
   @property
   def base(self): return self._base if self._base is not None else self
@@ -147,6 +149,18 @@ class LazyBuffer:
   def buffers(self) -> Tuple[LazyBuffer, ...]: return (self,)
   def map_buffers(self, real_srcs: Mapping[Any, Union[LazyBuffer, LazyOp]]): return real_srcs.get(self, self)
   def get_lazyops(self) -> List[LazyOp]: return []
+
+  def fill_temp(self, flood=False) -> LazyBuffer: # FIXME: flood does not have enough checks
+    if not hasattr(self, 'op'): return flood
+    if self.temp: return True
+    for buf in self.op.buffers:
+      self.temp = buf.fill_temp(flood) or self.temp or flood
+    return self.temp
+
+  def cleanse(self):
+    if not self.temp: return
+    self._realized = None
+    for buf in self.op.buffers: buf.cleanse()
 
   # *** scheduling ***
 

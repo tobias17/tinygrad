@@ -48,7 +48,7 @@ def get_grouped_dims(prefix, start_dim, local_dims, maxdim:int=0):
 class Linearizer(OptimizedKernel):
   def uop_alu_idx(self, a:UOp, b, ops, ctx:Linearizer, op, dtype=dtypes.int32):
     render_b:UOp = cast(UOp, (NumNode(b) if not isinstance(b, Node) else b).render(ops, ctx))
-    return self.uop(UOps.ALU, dtype, (a, render_b), op)
+    return self.uop(UOps.ALU, dtype, (a, render_b), (op,None,))
 
   # NOTE: the consts have to be be cached for deduping of downstream uops to work
   def const(self, b:Union[int,float], dtype=dtypes.int32) -> UOp: return self.uop(UOps.CONST, dtype, tuple(), b)
@@ -66,9 +66,10 @@ class Linearizer(OptimizedKernel):
 
     def rename_var(v: VariableOrNum, expr: str): return v if isinstance(v, NumNode) else Variable(expr, v.min, v.max)
 
+    load_dtype = (hasattr(self.bufs[i], 'load_dtype') and self.bufs[i].load_dtype)
     amt, dim = 1, None
     upcast_dim = self.get_upcast_dim(i)
-    if len(upcast_dim) == 1 and len(float4_expand := idxs[upcast_dim[0]].expand()) in [4,2]:
+    if not load_dtype and len(upcast_dim) == 1 and len(float4_expand := idxs[upcast_dim[0]].expand()) in [4,2]:
       dim, amt = upcast_dim[0], len(float4_expand)
 
     expand_vars = tuple([rename_var(idx.expand_idx(), f"_uidx{j}") for j, idx in enumerate(idxs)])
@@ -79,7 +80,7 @@ class Linearizer(OptimizedKernel):
         (g_idx, g_valid), amt, dim = self.sts[i].expr_idxs(fake_idxs), 1, None
     else:
       g_idx, g_valid = self.sts[i].expr_idxs(fake_idxs)
-    localtype = dtypes.float32 if amt == 1 else dtypes._float4 if amt == 4 else dtypes._float2
+    localtype = self.bufs[i].dtype if load_dtype else (dtypes.float32 if amt == 1 else dtypes._float4 if amt == 4 else dtypes._float2)
 
     e_idxs, e_valids = g_idx.expand(expand_vars), g_valid.expand(expand_vars)
 
@@ -96,7 +97,7 @@ class Linearizer(OptimizedKernel):
           self.load_cache[key] = self.const(this_const, localtype)
           if valid.min == 0 and valid.max == 1:
             valid_rendered = valid.render(self.render_ops, self)
-            self.load_cache[key] = self.uop(UOps.ALU, localtype, (valid_rendered, self.load_cache[key], self.const(invalid_value, localtype)), TernaryOps.WHERE)
+            self.load_cache[key] = self.uop(UOps.ALU, localtype, (valid_rendered, self.load_cache[key], self.const(invalid_value, localtype)), (TernaryOps.WHERE,None,))
         else:
           buf_uop = self.buf_uops[i]
           assert buf_uop is not None, f"buffer {i} wasn't UOped"
@@ -393,7 +394,7 @@ class Linearizer(OptimizedKernel):
     if uop == UOps.GEP and vin[0].uop == UOps.CONST: return self.const(vin[0].arg, dtype)
     if uop == UOps.ALU:
       # rewrites. NOTE: the rewritten NEG op is still around...
-      if arg == BinaryOps.ADD and vin[1].uop == UOps.ALU and vin[1].arg == UnaryOps.NEG: return self.uop(UOps.ALU, dtype, (vin[0], vin[1].vin[0]), BinaryOps.SUB, cachable=cachable)
+      if arg == BinaryOps.ADD and vin[1].uop == UOps.ALU and vin[1].arg == UnaryOps.NEG: return self.uop(UOps.ALU, dtype, (vin[0], vin[1].vin[0]), (BinaryOps.SUB,None,), cachable=cachable)
       # constant folding
       if arg == UnaryOps.NEG and vin[0].uop == UOps.CONST: return self.const(-vin[0].arg, dtype)
       # zero folding
@@ -426,12 +427,12 @@ class Linearizer(OptimizedKernel):
     if x.op in ops:
       ret = []
       for idx, val, off in zip([[i] for i in range(len(values[0]))], zip(*values), offs):
-        new_val = self.uop(UOps.ALU, dtypes.float32, val+(acc[off],), ops[x.op])
+        new_val = self.uop(UOps.ALU, dtypes.float32, val+(acc[off],), (ops[x.op],None,))
         # NOTE: we could apply the phi node to only the last change, but this breaks CLANG with nested max(x,y)
         acc[off] = self.uop(UOps.PHI, dtypes.float32, (acc[off], new_val))
         ret.append((idx, acc[off]))
     else:
-      ret = [(idx, self.uop(UOps.ALU, dtypes.float32, val, x.op)) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values))]
+      ret = [(idx, self.uop(UOps.ALU, dtypes.float32, val, (x.op,x.arg if x.op==BinaryOps.QUANT_UNPACK else None,))) for idx, val in zip([[i] for i in range(len(values[0]))], zip(*values))]
     ordered_ret: List[Optional[UOp]] = [None]*len(values[0])
     # scatter
     for i,j in ret:

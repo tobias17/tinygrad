@@ -360,7 +360,7 @@ class Tensor:
 
   def gather(self: Tensor, idx: Tensor, dim: int):
     assert idx.ndim == self.ndim, "self.ndim must equal idx.ndim"
-    assert all(s >= i for s,i in zip(self.shape, idx.shape)), "all dim of idx.shape must be smaller than self.shape"
+    assert all(s >= i for s,i in zip(self.shape, idx.shape)), "all dim of idx.shape must be no greater than self.shape"
     if dim < 0: dim += self.ndim
     idx = idx.transpose(ax1=dim, ax2=0).unsqueeze(-1)
     permarg = list(range(self.ndim))
@@ -422,6 +422,32 @@ class Tensor:
     order[ax1], order[ax2] = order[ax2], order[ax1]
     return self.permute(order)
   def flatten(self, start_dim=0): return self.reshape(shape=self.shape[:start_dim] + (-1,))
+
+  def mark_temp(self) -> Tensor:
+    self.lazydata.temp = True
+    return self
+
+  def fill_temp(self, flood=False) -> Tensor:
+    self.lazydata.fill_temp(flood)
+    return self
+
+  def apply_quant_scaling(self, bits: int, scale: Union[Tensor, Tuple[float], float], bias: Union[Tensor, Tuple[float], float], target_shape=None) -> Tensor:
+    assert self.dtype in (options:=(dtypes.uint16, dtypes.uint32, dtypes.uint64)), f"cannot dequantize dtype {self.dtype}, options are {options}"
+
+    assert (loop := (self.dtype.itemsize*8) // bits) > 1, f"source dtype ({self.dtype}: {self.dtype.itemsize*8} bits) must be >= 2x larger than mapping bits ({bits})"
+
+    if scale.__class__ is not Tensor: scale = Tensor(scale).reshape((self.shape[0],1,)) if scale.__class__ in {tuple, list, np.ndarray} else Tensor([scale])
+    if bias.__class__  is not Tensor: bias  = Tensor(bias ).reshape((self.shape[0],1,)) if bias.__class__  in {tuple, list, np.ndarray} else Tensor([bias] )
+    # FIXME: there has to be a better way of checking this stuff
+    assert self.ndim==scale.ndim and self.ndim==bias.ndim and self.ndim>=1 and self.ndim<=2, f"self, scale, and bias ndims needs match and be between 1 and 2, got {self.ndim}, {scale.ndim}, {bias.ndim}"
+    assert all((self.shape[0] == x.shape[0] if self.ndim == 2 else True) and (x.shape[-1] == 1) for x in (scale,bias,)), f"bias and scale must match outer dimesion of self and be 1 on inner dimension, got {scale.shape} and {bias.shape}"
+
+    data = self.reshape((*self.shape,1,)).expand((*self.shape,loop,))
+    idx  = Tensor.arange(loop, dtype=dtypes.uint8).mul(bits).reshape([1]*self.ndim+[loop]).expand((*self.shape,loop,))
+    scale, bias = [x.reshape((*x.shape,1,)).expand((*x.shape,loop,)) for x in (scale,bias,)]
+    
+    vals = mlops.QuantUnpack.apply(data, idx, mask=sum(1<<i for i in range(bits))).mul(scale).add(bias).mark_temp()
+    return vals.reshape(target_shape if target_shape else (*self.shape[:-1],self.shape[-1]*loop)).fill_temp()
 
   # ***** reduce ops *****
 

@@ -3,7 +3,7 @@ import time, importlib, inspect, functools, pathlib, itertools, random
 import numpy as np
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Union, Type, Tuple, Any, List, Optional, Dict, Callable, cast, Mapping
-from tinygrad.helpers import ansilen, prod, DEBUG, getenv, GlobalCounters, DType, colored, BEAM
+from tinygrad.helpers import ansilen, prod, DEBUG, getenv, GlobalCounters, DType, dtypes, colored, BEAM
 from tinygrad.runtime.lib import RawBuffer
 from tinygrad.shape.symbolic import Variable, sym_infer
 from dataclasses import dataclass
@@ -13,7 +13,7 @@ from dataclasses import dataclass
 # NOTE: MOD, CMPLT don't have to be implemented on vectors, just scalars
 # NOTE: rdna3 only has RECIP and not DIV. DIV and POW are on the chopping block
 class UnaryOps(Enum): NOOP = auto(); EXP2 = auto(); LOG2 = auto(); CAST = auto(); SIN = auto(); SQRT = auto(); RECIP = auto(); NEG = auto() # noqa: E702
-class BinaryOps(Enum): ADD = auto(); SUB = auto(); MUL = auto(); DIV = auto(); MAX = auto(); MOD = auto(); CMPLT = auto() # noqa: E702
+class BinaryOps(Enum): ADD = auto(); SUB = auto(); MUL = auto(); DIV = auto(); MAX = auto(); MOD = auto(); CMPLT = auto(); QUANT_UNPACK = auto() # noqa: E702
 class TernaryOps(Enum): MULACC = auto(); WHERE = auto() # noqa: E702
 class ReduceOps(Enum): SUM = auto(); MAX = auto() # noqa: E702
 class BufferOps(Enum): MEM = auto(); CONST = auto() # noqa: E702
@@ -33,12 +33,14 @@ class MemBuffer:
   idx: int
   dtype: DType
   st: ShapeTracker
+  load_dtype: bool = False
 
 @dataclass(frozen=True)
 class ConstBuffer:
   val: Any
   dtype: DType
   st: ShapeTracker
+  load_dtype: bool = False
 
 @dataclass(frozen=True)
 class ScheduleItem:
@@ -155,8 +157,9 @@ shape_fxn_for_op: Dict[Op, Callable] = {
   BufferOps.MEM: lambda arg: (arg.st.shape, arg.dtype, 0), BufferOps.CONST: lambda arg: (arg.st.shape, arg.dtype, 0),
   UnaryOps.CAST: lambda self,arg: (self.shape, arg[0], self.consume_flops()),   # cast uses no flops
   **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op != UnaryOps.CAST},
-  **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps},
+  **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps if op != BinaryOps.QUANT_UNPACK},
   **{op:lambda self,new_shape: (new_shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in ReduceOps},
+  BinaryOps.QUANT_UNPACK: lambda self,y,arg: (self.shape, dtypes.float32, self.consume_flops() + y.consume_flops()),
   TernaryOps.WHERE: lambda self,y,z: (self.shape, y.dtype, self.consume_flops() + y.consume_flops() + z.consume_flops() + prod(self.shape))}
 InterpretedFlopCounter = Interpreted(FlopCounter, shape_fxn_for_op, lambda x: x)
 def get_lazyop_info(ast:LazyOp) -> FlopCounter: return InterpretedFlopCounter.exec_ast(ast)
@@ -286,6 +289,7 @@ class Compiled:
       prg = get_program()
 
     if prg.name == getenv("PRINT_PRG", ''): print(prg.prg)
+    # print(prg.prg)
 
     prg.exec(rawbuffers, var_vals={k:var_vals[k] for k in ast_vars})
     return output.realized

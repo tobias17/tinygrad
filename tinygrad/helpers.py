@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, functools, platform, time, re, contextlib, operator, pathlib, hashlib, tempfile
+import os, functools, platform, time, re, contextlib, operator, pathlib, hashlib, tempfile, collections
 import numpy as np
 from typing import Dict, Tuple, Union, List, NamedTuple, Final, Iterator, ClassVar, Optional, Iterable, Any, TypeVar, TYPE_CHECKING
 if TYPE_CHECKING:  # TODO: remove this and import TypeGuard from typing once minimum python supported version is 3.10
@@ -149,7 +149,12 @@ class GlobalCounters:
   time_sum_s: ClassVar[float] = 0.0
   kernel_count: ClassVar[int] = 0
   mem_used: ClassVar[int] = 0   # NOTE: this is not reset
+  max_mem: ClassVar[int] = 0
   mem_cached: ClassVar[int] = 0 # NOTE: this is not reset
+  mem_used_alloc: ClassVar = collections.defaultdict(int)
+  max_mem_alloc: ClassVar = collections.defaultdict(int)
+  iteration: ClassVar[int] = -1
+  kernel_times: ClassVar[List[int]] = []
   @staticmethod
   def reset(): GlobalCounters.global_ops, GlobalCounters.global_mem, GlobalCounters.time_sum_s, GlobalCounters.kernel_count = 0,0,0.0,0
 

@@ -14,8 +14,13 @@ class RawBuffer:  # pylint: disable=abstract-method
     self._allocator = allocator
     self._device = kwargs.get('device', None)
     GlobalCounters.mem_used += self._memsz
+    GlobalCounters.mem_used_alloc[allocator] += self._memsz
+    GlobalCounters.max_mem = max(GlobalCounters.mem_used, GlobalCounters.max_mem)
+    GlobalCounters.max_mem_alloc[allocator] = max(GlobalCounters.mem_used_alloc[allocator], GlobalCounters.max_mem_alloc[allocator])
   def __del__(self):  # NOTE: if it fails on init (bad dtype), it won't have a _memsz
-    if hasattr(self, '_memsz'): GlobalCounters.mem_used -= self._memsz
+    if hasattr(self, '_memsz'):
+      GlobalCounters.mem_used -= self._memsz
+      GlobalCounters.mem_used_alloc[self._allocator] -= self._memsz
     if hasattr(self, '_allocator') and self._allocator: self._allocator.free(self._buf)
   def __repr__(self): return f"buffer<{self.size}, {self.dtype}, {id(self)}>"
   @property

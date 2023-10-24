@@ -1,6 +1,6 @@
 import tinygrad.nn as nn
 from tinygrad.tensor import Tensor
-from extra.utils import get_child
+from extra.quantize import load_direct
 
 class BasicBlock:
   expansion = 1
@@ -118,7 +118,7 @@ class ResNet:
   def __call__(self, x:Tensor) -> Tensor:
     return self.forward(x)
 
-  def load_from_pretrained(self):
+  def load_from_pretrained(self, loader=load_direct, **kwargs):
     # TODO replace with fake torch load
 
     model_urls = {
@@ -134,17 +134,21 @@ class ResNet:
 
     from torch.hub import load_state_dict_from_url
     state_dict = load_state_dict_from_url(self.url, progress=True)
-    for k, v in state_dict.items():
-      obj = get_child(self, k)
-      dat = v.detach().numpy()
 
+    def skip_load_fxn(k, obj, dat):
       if 'fc.' in k and obj.shape != dat.shape:
         print("skipping fully connected layer")
-        continue # Skip FC if transfer learning
-
+        return True # Skip FC if transfer learning
+      return False
+    def skip_quant_fxn(k, obj, dat):
+      return not k.endswith("weight")
+    def assign_fxn(obj, dat):
       # TODO: remove or when #777 is merged
       assert obj.shape == dat.shape or (obj.shape == (1,) and dat.shape == ()), (k, obj.shape, dat.shape)
       obj.assign(dat)
+    
+    loader(self, state_dict, skip_load_fxn=skip_load_fxn, skip_quant_fxn=skip_quant_fxn, assign_fxn=assign_fxn, **kwargs)
+    return self
 
 ResNet18 = lambda num_classes=1000: ResNet(18, num_classes=num_classes)
 ResNet34 = lambda num_classes=1000: ResNet(34, num_classes=num_classes)
