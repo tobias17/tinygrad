@@ -2,7 +2,7 @@
 # https://github.com/ekagra-ranjan/huggingface-blog/blob/main/stable_diffusion.md
 import tempfile
 from pathlib import Path
-import gzip, argparse, math, re
+import gzip, argparse, math, re, os
 from functools import lru_cache
 from collections import namedtuple
 
@@ -12,6 +12,7 @@ from tinygrad.ops import Device
 from tinygrad.helpers import dtypes, GlobalCounters, Timing
 from tinygrad.nn import Conv2d, Linear, GroupNorm, LayerNorm, Embedding
 from extra.utils import download_file
+from extra.quantize import load_direct, quantize_std_scalar
 from tinygrad.nn.state import torch_load, load_state_dict, get_state_dict
 from tinygrad.jit import TinyJit
 
@@ -576,11 +577,12 @@ if __name__ == "__main__":
 
   # load in weights
   download_file('https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt', FILENAME)
-  load_state_dict(model, torch_load(FILENAME)['state_dict'], strict=False)
+  # load_state_dict(model, torch_load(FILENAME)['state_dict'], strict=False)
+  quantize_std_scalar(model, torch_load(FILENAME)['state_dict'], 4, 16, sigma=3.3, cache_dirpath=f"{str(FILENAME)[::-1].split('.')[0][::-1]}_qcache/", out_dtype=dtypes.float16)
 
-  if args.fp16:
-    for l in get_state_dict(model).values():
-      l.assign(l.cast(dtypes.float16).realize())
+  # if args.fp16:
+  #   for l in get_state_dict(model).values():
+  #     l.assign(l.cast(dtypes.float16).realize())
 
   # run through CLIP to get context
   tokenizer = ClipTokenizer()

@@ -200,6 +200,8 @@ def get_child(parent, key):
       obj = obj[int(k)]
     elif isinstance(obj, dict):
       obj = obj[k]
+    elif k == "inner_attention" or k == "betas":
+      return None
     else:
       obj = getattr(obj, k)
   return obj

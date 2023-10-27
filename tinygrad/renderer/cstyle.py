@@ -38,7 +38,7 @@ class CStyleLanguage(NamedTuple):
     BinaryOps.MUL: lambda a,b: f"({a}*{b})", BinaryOps.DIV: lambda a,b: f"({a}/{b})",
     BinaryOps.MAX: lambda a,b: f"max({a},{b})", BinaryOps.MOD: lambda a,b: f"({a}%{b})",
     BinaryOps.CMPLT: lambda a,b: f"({a}<{b})", TernaryOps.MULACC: lambda a,b,c: f"(({a}*{b})+{c})",
-    BinaryOps.QUANT_UNPACK: lambda a,b,m: f"({a}>>{b}&{m})",
+    BinaryOps.QUANT_UNPACK: lambda a,b,m: f"(((unsigned int)({a}))>>((unsigned int)({b}))&{m})",
     TernaryOps.WHERE: lambda a,b,c: f"({a}!=0?{b}:{c})",
   }
 

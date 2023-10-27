@@ -220,7 +220,7 @@ class LazyBuffer:
 
   # *** elementwise ops ***
 
-  def e(self:LazyBuffer, op:Union[UnaryOps, BinaryOps, TernaryOps], *srcs:LazyBuffer, arg:Optional[Any]=None) -> LazyBuffer:
+  def e(self:LazyBuffer, op:Union[UnaryOps, BinaryOps, TernaryOps], *srcs:LazyBuffer, arg:Optional[Any]=None, override_dtype=None) -> LazyBuffer:
     # srcs includes self
     srcs = (self,)+srcs
 
@@ -229,6 +229,7 @@ class LazyBuffer:
 
     # get outputs now
     out_device, out_shape, out_dtype = srcs[0].device, srcs[0].shape, max([x.dtype for x in srcs]) if op != UnaryOps.CAST else cast(Tuple[DType, bool], arg)[0]
+    if override_dtype is not None: out_dtype = override_dtype
 
     # push all contiguous to the end of BinaryOps. kernels 198 -> 196
     if PUSH_CONTIGUOUS and any(not x.realized and x.op.op == LoadOps.CONTIGUOUS and len(x.op.src[0].children) <= 1 for x in srcs):

@@ -51,7 +51,8 @@ else:
   class CUDAAllocator(LRUAllocator):
     def _do_alloc(self, size, dtype, device, **kwargs): return cuda.mem_alloc(size * dtype.itemsize) # type: ignore
     def _cached_bufkey(self, size, dtype, device): return (device, size*dtype.itemsize) # Buffers of the same length could be reused, no matter what dtype.
-  CUDAAlloc = CUDAAllocator(pycuda.driver.Context.get_device().total_memory())
+  max_mem = pycuda.driver.Context.get_device().total_memory()
+  CUDAAlloc = CUDAAllocator(int(max_mem*0.7))
   class RawCUDABuffer(RawBufferCopyInOut): # type: ignore
     def __init__(self, size, dtype): super().__init__(size, dtype, allocator=CUDAAlloc)
     def _copyin(self, x:np.ndarray, stream:Optional[cuda.Stream]=None): cuda.memcpy_htod_async(self._buf, x.ravel(), stream) # type: ignore

@@ -17,8 +17,19 @@ from tinygrad.nn.state import safe_load, torch_load, load_state_dict
 from tinygrad.ops import GlobalCounters
 from tinygrad.jit import TinyJit, JIT_SUPPORTED_DEVICE
 from tinygrad.shape.symbolic import Variable, sym_infer
+from extra.quantize import quantize_std_scalar
+from extra.utils import mem_to_string
 
-JIT = getenv("JIT", 0 if CI else int(Device.DEFAULT in JIT_SUPPORTED_DEVICE))
+Device.DEFAULT = "CUDA"
+JIT = 0 # getenv("JIT", 0 if CI else int(Device.DEFAULT in JIT_SUPPORTED_DEVICE))
+
+def log_mem():
+  print("|======|==========|==========|")
+  print("| Aloc | Current  | Maximum  |")
+  print("|======|==========|==========|")
+  for alloc in GlobalCounters.mem_used_alloc:
+    print(f"| {('None' if not alloc else str(alloc).split('.',4)[-1]+' '*4)[:4]} | {mem_to_string(GlobalCounters.mem_used_alloc[alloc])} | {mem_to_string(GlobalCounters.max_mem_alloc[alloc])} |")
+  print("|======|==========|==========|")
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
@@ -115,11 +126,11 @@ class TransformerBlock:
 
   def __call__(self, x:Tensor, cache_k:Optional[Tensor], cache_v:Optional[Tensor], start_pos:int, freqs_cis:Tensor, mask:Optional[Tensor], jit_ctx:Optional[Dict[Variable,int]]=None):
     bsz, seqlen, _ = x.shape
-    if JIT and mask is None:
-      assert cache_k is not None and cache_v is not None, "no cache"
-      pos = Variable("pos", 1, 1024).bind(start_pos)
-      cache_k = cache_k.reshape(cache_k.shape[0], pos, cache_k.shape[2], cache_k.shape[3])
-      cache_v = cache_v.reshape(cache_v.shape[0], pos, cache_v.shape[2], cache_v.shape[3])
+    # if JIT and mask is None:
+    #   assert cache_k is not None and cache_v is not None, "no cache"
+    #   pos = Variable("pos", 1, 1024).bind(start_pos)
+    #   cache_k = cache_k.reshape(cache_k.shape[0], pos, cache_k.shape[2], cache_k.shape[3])
+    #   cache_v = cache_v.reshape(cache_v.shape[0], pos, cache_v.shape[2], cache_v.shape[3])
 
     output, cache_k, cache_v = self.attention(self.attention_norm(x), cache_k, cache_v, start_pos, freqs_cis, mask, jit_ctx=jit_ctx)
     h = x + output
@@ -135,9 +146,9 @@ class Transformer:
     self.freqs_cis = precompute_freqs_cis(dim // n_heads, max_seq_len * 2, rope_theta)
     self.norm_output = lambda x: self.output(self.norm(x))
 
-    self.tok_embeddings_jitted = TinyJit(lambda x: self.tok_embeddings(x).realize())
-    self.postprocess_jitted = TinyJit(self.postprocess)
-    self.layers_jitted = [TinyJit(layer.__call__) for layer in self.layers]
+    self.tok_embeddings_jitted = lambda x: self.tok_embeddings(x).realize()
+    self.postprocess_jitted = self.postprocess
+    self.layers_jitted = [layer.__call__ for layer in self.layers]
 
   def postprocess(self, x, temperature:Optional[float]):
     logits = self.output(self.norm(x))
@@ -247,9 +258,9 @@ def concat_weights(models):
   def convert(name) -> Tensor:
     disk_tensors = [model[name] for model in models]
     if len(disk_tensors) == 1 or len(disk_tensors[0].shape) == 1:
-      return disk_tensors[0].to(device=Device.DEFAULT)
+      return disk_tensors[0]
     axis = 1 if name.startswith("tok_embeddings.") or name.endswith(".attention.wo.weight") or name.endswith(".feed_forward.w2.weight") else 0
-    lazy_tensors = [data.to(device=Device.DEFAULT) for data in disk_tensors]
+    lazy_tensors = [data for data in disk_tensors]
     return lazy_tensors[0].cat(*lazy_tensors[1:], dim=axis)
   return {name: convert(name) for name in {name: None for model in models for name in model}}
 
@@ -317,7 +328,8 @@ class LLaMa:
     if quantize:
       weights = AbsmaxQuantizedLinear.quantize(weights)
       for _,v in weights.items(): v.realize()
-    load_state_dict(model, weights, strict=False)
+    # load_state_dict(model, weights, strict=False)
+    quantize_std_scalar(model, weights, bits=4, cache_dirpath=f"{model_path}/qcache", sigma=3.3, group_size=16)
 
     return LLaMa(model, sp_model)
 
@@ -542,6 +554,7 @@ After you are done speaking, output [EOS]. You are not Chad.
   while 1:
     # add tokens from user in chatbot mode
     if chatbot:
+      log_mem()
       user_prompt = user_delim + input(user_delim) + "\n"
       outputted += user_prompt
 

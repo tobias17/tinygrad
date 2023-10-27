@@ -8,6 +8,9 @@ from tinygrad.runtime.lib import RawBuffer
 from tinygrad.shape.symbolic import Variable, sym_infer
 from dataclasses import dataclass
 
+import shelve
+global_db = shelve.open("/tmp/beam_cache")
+
 # these are the llops your accelerator must implement, along with toCpu
 # the Enum class doesn't work with mypy, this is static. sorry it's ugly
 # NOTE: MOD, CMPLT don't have to be implemented on vectors, just scalars
@@ -159,7 +162,7 @@ shape_fxn_for_op: Dict[Op, Callable] = {
   **{op:lambda self: (self.shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in UnaryOps if op != UnaryOps.CAST},
   **{op:lambda self,y: (self.shape, max(self.dtype, y.dtype), self.consume_flops() + y.consume_flops() + prod(self.shape)) for op in BinaryOps if op != BinaryOps.QUANT_UNPACK},
   **{op:lambda self,new_shape: (new_shape, self.dtype, self.consume_flops() + prod(self.shape)) for op in ReduceOps},
-  BinaryOps.QUANT_UNPACK: lambda self,y,arg: (self.shape, dtypes.float32, self.consume_flops() + y.consume_flops()),
+  BinaryOps.QUANT_UNPACK: lambda self,y,arg: (self.shape, dtypes.float16, self.consume_flops() + y.consume_flops()),
   TernaryOps.WHERE: lambda self,y,z: (self.shape, y.dtype, self.consume_flops() + y.consume_flops() + z.consume_flops() + prod(self.shape))}
 InterpretedFlopCounter = Interpreted(FlopCounter, shape_fxn_for_op, lambda x: x)
 def get_lazyop_info(ast:LazyOp) -> FlopCounter: return InterpretedFlopCounter.exec_ast(ast)
@@ -230,6 +233,8 @@ class Compiled:
 
   def to_program(self, k):
     k.linearize()
+    if any(k.global_size[i] > 66000 for i in range(3)):
+      print("overshot")
     src, runtime_args = self.renderer(k.function_name, k.uops)
     return ASTRunner(k.function_name, src, k.global_size, k.local_size,
                      op_estimate=k.info.flops, mem_estimate=k.mem_estimate,
@@ -275,11 +280,24 @@ class Compiled:
           kb.required_optimizations()
           kb.dont_use_locals = bool(getenv("NOLOCALS"))
           from tinygrad.features.search import beam_search, time_linearizer
-          kb = beam_search(kb, rawbuffers, BEAM.value)
+          if str(kb.ast) in global_db:
+            for ao in global_db[str(kb.ast)]:
+              kb.apply_opt(ao)
+          else:
+            kb = beam_search(kb, rawbuffers, BEAM.value)
+            global_db[str(kb.ast)] = kb.applied_opts
           baseline, beamtime = time_linearizer(k, rawbuffers, allow_test_size=False, disable_cache=True), time_linearizer(kb, rawbuffers, allow_test_size=False, disable_cache=True)
           if beamtime < baseline:
             if DEBUG >= 1: print(f"beam search {beamtime*1e6:<12.2f} beat baseline {baseline*1e6:<12.2f} by {baseline/beamtime:.2f}x")
             k = kb
+        else:
+          kb = Linearizer(ast, self.linearizer_opts)
+          kb.required_optimizations()
+          kb.dont_use_locals = bool(getenv("NOLOCALS"))
+          # if str(kb.ast) in global_db:
+          #   for ao in global_db[str(kb.ast)]:
+          #     kb.apply_opt(ao)
+          #   k = kb
       return self.to_program(k)
 
     if getenv("ENABLE_METHOD_CACHE", 1):

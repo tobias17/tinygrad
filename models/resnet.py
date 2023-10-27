@@ -144,7 +144,7 @@ class ResNet:
       return not k.endswith("weight")
     def assign_fxn(obj, dat):
       # TODO: remove or when #777 is merged
-      assert obj.shape == dat.shape or (obj.shape == (1,) and dat.shape == ()), (k, obj.shape, dat.shape)
+      assert obj.shape == dat.shape or (obj.shape == (1,) and dat.shape == ()), (obj.shape, dat.shape)
       obj.assign(dat)
     
     loader(self, state_dict, skip_load_fxn=skip_load_fxn, skip_quant_fxn=skip_quant_fxn, assign_fxn=assign_fxn, **kwargs)
