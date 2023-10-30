@@ -26,8 +26,7 @@ def run_schedule(schedule:List[ScheduleItem], disable_logging=False):
     else:
       si.out.realized = Device[si.out.device].exec_ast(si.ast, output=si.out, inputs=si.inputs, var_vals=si.var_vals, **si.out._device_extra_args())
       for b in si.inputs:
-        if hasattr(b, 'op') and b.temp:
-          b.cleanse() # FIXME: this needs more checks
+        if hasattr(b, 'op') and b.temp and not any(b in x.inputs for x in schedule): b.cleanse()
     if not si.out.temp: del si.out.op
     for v in si.out.views:
       if not v.temp: del v.op

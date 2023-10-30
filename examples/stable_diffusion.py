@@ -11,7 +11,7 @@ from tinygrad.tensor import Tensor
 from tinygrad.ops import Device
 from tinygrad.helpers import dtypes, GlobalCounters, Timing
 from tinygrad.nn import Conv2d, Linear, GroupNorm, LayerNorm, Embedding
-from extra.utils import download_file
+from extra.utils import download_file, mem_to_string
 from extra.quantize import load_direct, quantize_std_scalar
 from tinygrad.nn.state import torch_load, load_state_dict, get_state_dict
 from tinygrad.jit import TinyJit
@@ -557,6 +557,15 @@ class StableDiffusion:
 # ** ldm.modules.encoders.modules.FrozenCLIPEmbedder
 # cond_stage_model.transformer.text_model
 
+def log_mem(label):
+  print(f"\n{label}:")
+  print("|======|==========|==========|")
+  print("| Aloc | Current  | Maximum  |")
+  print("|======|==========|==========|")
+  for alloc in GlobalCounters.mem_used_alloc:
+    print(f"| {('None' if not alloc else str(alloc).split('.',4)[-1]+' '*4)[:4]} | {mem_to_string(GlobalCounters.mem_used_alloc[alloc])} | {mem_to_string(GlobalCounters.max_mem_alloc[alloc])} |")
+  print("|======|==========|==========|\n")
+
 # this is sd-v1-4.ckpt
 FILENAME = Path(__file__).parents[1] / "weights/sd-v1-4.ckpt"
 
@@ -570,6 +579,10 @@ if __name__ == "__main__":
   parser.add_argument('--timing', action='store_true', help="Print timing per step")
   parser.add_argument('--seed', type=int, help="Set the random latent seed")
   parser.add_argument('--guidance', type=float, default=7.5, help="Prompt strength")
+  parser.add_argument('--quantize', action='store_true', help="Quantizes the weights to 6 bits")
+  
+  parser.add_argument('--group-size', type=int, default=20)
+  parser.add_argument('--sigma', type=float, default=4.8)
   args = parser.parse_args()
 
   Tensor.no_grad = True
@@ -577,12 +590,16 @@ if __name__ == "__main__":
 
   # load in weights
   download_file('https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt', FILENAME)
-  # load_state_dict(model, torch_load(FILENAME)['state_dict'], strict=False)
-  quantize_std_scalar(model, torch_load(FILENAME)['state_dict'], 4, 16, sigma=3.3, cache_dirpath=f"{str(FILENAME)[::-1].split('.')[0][::-1]}_qcache/", out_dtype=dtypes.float16)
 
-  # if args.fp16:
-  #   for l in get_state_dict(model).values():
-  #     l.assign(l.cast(dtypes.float16).realize())
+  if args.quantize:
+    quantize_std_scalar(model, torch_load(FILENAME)['state_dict'], bits=6, group_size=args.group_size, sigma=args.sigma, store_dtype=dtypes.uint32) #, cache_dirpath=f"{str(FILENAME)[::-1].split('.')[-1][::-1]}_qcache/")
+  else:
+    load_direct(model, torch_load(FILENAME)['state_dict'])
+    if args.fp16:
+      for l in get_state_dict(model).values():
+        l.assign(l.cast(dtypes.float16).realize())
+
+  log_mem("Post-load Memory")
 
   # run through CLIP to get context
   tokenizer = ClipTokenizer()
@@ -665,3 +682,5 @@ if __name__ == "__main__":
   im.save(args.out)
   # Open image.
   if not args.noshow: im.show()
+
+  log_mem("Post-run Memory")

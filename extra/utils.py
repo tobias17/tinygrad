@@ -193,14 +193,15 @@ def fake_torch_load(b0):
 
   return ret
 
-def get_child(parent, key):
+def get_child(parent, key, strict=False):
   obj = parent
   for k in key.split('.'):
     if k.isnumeric():
       obj = obj[int(k)]
     elif isinstance(obj, dict):
       obj = obj[k]
-    elif k == "inner_attention" or k == "betas":
+    elif not hasattr(obj, k) and not strict:
+      if DEBUG >= 1: print(f"WARNING: not loading {k}")
       return None
     else:
       obj = getattr(obj, k)

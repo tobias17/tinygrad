@@ -11,10 +11,10 @@ from tqdm import tqdm, trange
 
 np.random.seed(1)
 
-cache_dirpath = None
-# cache_dirpath = os.path.realpath(f"{os.path.dirname(__file__)}/../weights/resnet50")
+# cache_dirpath = None
+cache_dirpath = os.path.realpath(f"{os.path.dirname(__file__)}/../weights/resnet50")
 
-bits = 5
+bits = 4
 gs = { 4: 16, 5: 15, 6: 18 }
 mdl = ResNet50().load_from_pretrained(loader=quantize_std_scalar, bits=bits, group_size=gs[bits], sigma=3.3, cache_dirpath=cache_dirpath)
 # mdl = ResNet50().load_from_pretrained()

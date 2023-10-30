@@ -233,8 +233,6 @@ class Compiled:
 
   def to_program(self, k):
     k.linearize()
-    if any(k.global_size[i] > 66000 for i in range(3)):
-      print("overshot")
     src, runtime_args = self.renderer(k.function_name, k.uops)
     return ASTRunner(k.function_name, src, k.global_size, k.local_size,
                      op_estimate=k.info.flops, mem_estimate=k.mem_estimate,

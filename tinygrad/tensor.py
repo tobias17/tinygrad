@@ -424,7 +424,6 @@ class Tensor:
   def flatten(self, start_dim=0): return self.reshape(shape=self.shape[:start_dim] + (-1,))
 
   def mark_temp(self) -> Tensor:
-    return self
     self.lazydata.temp = True
     return self
 
@@ -433,8 +432,8 @@ class Tensor:
     return self
 
   def apply_quant_scaling(self, bits: int, scale: Union[Tensor, Tuple[float], float], bias: Union[Tensor, Tuple[float], float], target_shape=None) -> Tensor:
-    assert self.dtype == dtypes.uint16, f"can only quant unpack uint16 until loading is fixed, got {self.dtype}"
-    # assert self.dtype in (options:=(dtypes.uint16, dtypes.uint32, dtypes.uint64,)), f"cannot dequantize dtype {self.dtype}, options are {options}"
+    # assert self.dtype == dtypes.uint16, f"can only quant unpack uint16 until loading is fixed, got {self.dtype}"
+    assert self.dtype in (options:=(dtypes.uint16, dtypes.uint32, dtypes.uint64,)), f"cannot dequantize dtype {self.dtype}, options are {options}"
 
     assert (loop := (self.dtype.itemsize*8) // bits) > 1, f"source dtype ({self.dtype}: {self.dtype.itemsize*8} bits) must be >= 2x larger than mapping bits ({bits})"
 
@@ -447,16 +446,14 @@ class Tensor:
     data = self.reshape((*self.shape,1,)).expand((*self.shape,loop,))
     idx  = Tensor.arange(loop, dtype=dtypes.uint8).mul(bits).reshape([1]*self.ndim+[loop]).expand((*self.shape,loop,))
     scale, bias = [x.reshape((*x.shape,1,)).expand((*x.shape,loop,)) for x in (scale,bias,)]
-    
+    scale.realize(), bias.realize()
+
     vals = mlops.QuantUnpack.apply(data, idx, mask=sum(1<<i for i in range(bits)), out_dtype=dtypes.float16).mark_temp().mul(scale).mark_temp().add(bias).mark_temp() # .mark_temp().cast(dtypes.float16)
     if target_shape is not None and (slice_amnt:=prod(self.shape)*loop-prod(target_shape)) != 0:
       assert slice_amnt > 0 and slice_amnt < loop*self.shape[-1], f"prod of target_shape ({prod(target_shape)}) must be between 0 and {loop*self.shape[-1]} less than prod of expanded shape ({prod(self.shape)*loop})"
-      # a = vals.reshape(-1)
-      # b = a.shrink(((0,prod(target_shape,)),))
-
       vals = vals.reshape(-1).shrink(((0,prod(target_shape,)),))
 
-    return vals.reshape(target_shape if target_shape else (*self.shape[:-1],self.shape[-1]*loop)) #.fill_temp()
+    return vals.reshape(target_shape if target_shape else (*self.shape[:-1],self.shape[-1]*loop)).fill_temp()
 
   # ***** reduce ops *****
 

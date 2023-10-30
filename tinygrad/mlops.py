@@ -126,7 +126,7 @@ class Div(Function):
 
 class QuantUnpack(Function):
   def forward(self, x:LazyBuffer, y:LazyBuffer, mask: int, out_dtype: DType) -> LazyBuffer:
-    # x.load_dtype = y.load_dtype = True
+    x.load_dtype = y.load_dtype = True
     return x.e(BinaryOps.QUANT_UNPACK, y, arg=mask, override_dtype=out_dtype)
 
   def backward(self, grad_output:LazyBuffer): assert False, "cannot go backwards through a Qunatizaiton Unpacking"
