@@ -5,6 +5,7 @@ from pathlib import Path
 import gzip, argparse, math, re
 from functools import lru_cache
 from collections import namedtuple
+from typing import List, Union
 
 from tqdm import tqdm
 from tinygrad.tensor import Tensor
@@ -254,50 +255,65 @@ def timestep_embedding(timesteps, dim, max_period=10000):
   args = timesteps * freqs
   return Tensor.cat(args.cos(), args.sin()).reshape(1, -1)
 
+MODEL_PARAMS = {
+  "1":  { "dim": 320, "context_dim":  768, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4,4], "attn_levels": [0,1,2],   "n_heads":  8 },
+  "2":  { "dim": 320, "context_dim": 1024, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4,4], "attn_levels": [0,1,2,3], "d_head":  64 },
+  "XL": { "dim": 320, "context_dim": 2048, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4],   "attn_levels": [1,2],     "d_head":  64 },
+}
+
 class UNetModel:
-  def __init__(self):
+  def __init__(self, dim, context_dim, in_channels, out_channels, channel_mult, attn_levels, n_heads=-1, d_head=-1):
+    tch = dim*4
     self.time_embed = [
-      Linear(320, 1280),
+      Linear(dim, tch),
       Tensor.silu,
-      Linear(1280, 1280),
+      Linear(tch, tch),
     ]
-    self.input_blocks = [
-      [Conv2d(4, 320, kernel_size=3, padding=1)],
-      [ResBlock(320, 1280, 320), SpatialTransformer(320, 768, 8, 40)],
-      [ResBlock(320, 1280, 320), SpatialTransformer(320, 768, 8, 40)],
-      [Downsample(320)],
-      [ResBlock(320, 1280, 640), SpatialTransformer(640, 768, 8, 80)],
-      [ResBlock(640, 1280, 640), SpatialTransformer(640, 768, 8, 80)],
-      [Downsample(640)],
-      [ResBlock(640, 1280, 1280), SpatialTransformer(1280, 768, 8, 160)],
-      [ResBlock(1280, 1280, 1280), SpatialTransformer(1280, 768, 8, 160)],
-      [Downsample(1280)],
-      [ResBlock(1280, 1280, 1280)],
-      [ResBlock(1280, 1280, 1280)]
+
+    # structuring adapted from: https://github.com/Stability-AI/generative-models/blob/059d8e9cd9c55aea1ef2ece39abf605efb8b7cc9/sgm/modules/diffusionmodules/openaimodel.py
+
+    # TODO: add 'transformer_depth' for SpacialTransformer
+
+    self.input_blocks: List[List[Union[ResBlock,SpatialTransformer,Downsample,Conv2d]]] = [
+      [Conv2d(in_channels, dim, kernel_size=3, padding=1)],
     ]
+    ch = dim
+    input_channels = [dim]
+    for level, mult in enumerate(channel_mult):
+      pch, ch = ch, mult*dim
+      for i in range(2):
+        n_heads, d_head = (ch//d_head, d_head) if n_heads==-1 else (n_heads, ch//n_heads)
+        self.input_blocks.append([
+          ResBlock(pch if i==0 else ch, tch, ch),
+          *([SpatialTransformer(ch, context_dim, n_heads, d_head)] if level in attn_levels else [])
+        ])
+        input_channels.append(ch)
+      if level < len(channel_mult) - 1:
+        self.input_blocks.append([Downsample(ch)])
+        input_channels.append(ch)
+
+    n_heads, d_head = (ch//d_head, d_head) if n_heads==-1 else (n_heads, ch//n_heads)
     self.middle_block = [
-      ResBlock(1280, 1280, 1280),
-      SpatialTransformer(1280, 768, 8, 160),
-      ResBlock(1280, 1280, 1280)
+      ResBlock(ch, tch, ch),
+      SpatialTransformer(ch, context_dim, n_heads, d_head),
+      ResBlock(ch, tch, ch)
     ]
-    self.output_blocks = [
-      [ResBlock(2560, 1280, 1280)],
-      [ResBlock(2560, 1280, 1280)],
-      [ResBlock(2560, 1280, 1280), Upsample(1280)],
-      [ResBlock(2560, 1280, 1280), SpatialTransformer(1280, 768, 8, 160)],
-      [ResBlock(2560, 1280, 1280), SpatialTransformer(1280, 768, 8, 160)],
-      [ResBlock(1920, 1280, 1280), SpatialTransformer(1280, 768, 8, 160), Upsample(1280)],
-      [ResBlock(1920, 1280, 640), SpatialTransformer(640, 768, 8, 80)],  # 6
-      [ResBlock(1280, 1280, 640), SpatialTransformer(640, 768, 8, 80)],
-      [ResBlock(960, 1280, 640), SpatialTransformer(640, 768, 8, 80), Upsample(640)],
-      [ResBlock(960, 1280, 320), SpatialTransformer(320, 768, 8, 40)],
-      [ResBlock(640, 1280, 320), SpatialTransformer(320, 768, 8, 40)],
-      [ResBlock(640, 1280, 320), SpatialTransformer(320, 768, 8, 40)],
-    ]
+
+    self.output_blocks: List[List[Union[ResBlock,SpatialTransformer,Upsample]]] = []
+    for level, mult in list(enumerate(channel_mult))[::-1]:
+      for i in range(3):
+        ich = input_channels.pop()
+        n_heads, d_head = (ch//d_head, d_head) if n_heads==-1 else (n_heads, ch//n_heads)
+        self.output_blocks.append([
+          ResBlock(ch+ich, tch, dim*mult),
+          *([SpatialTransformer(ch, context_dim, n_heads, d_head)] if level in attn_levels else []),
+          *([Upsample(ch)] if (i==2 and level<len(channel_mult)-1) else [])
+        ])
+
     self.out = [
-      GroupNorm(32, 320),
+      GroupNorm(32, ch),
       Tensor.silu,
-      Conv2d(320, 4, kernel_size=3, padding=1)
+      Conv2d(dim, out_channels, kernel_size=3, padding=1)
     ]
 
   def __call__(self, x, timesteps=None, context=None):
