@@ -635,7 +635,8 @@ class Tensor:
   def abs(self): return self.relu() + (-self).relu()
   def sign(self): return self / (self.abs() + 1e-10)
   def reciprocal(self): return 1.0/self
-
+  def normalize(self, p=2.0, dim=1, eps=1e-12): return self / (self.pow(p).sum(dim,True).sqrt()+eps) # FIXME: add tests
+ 
   # ***** activation functions (unary) *****
 
   def elu(self, alpha=1.0): return self.relu() - alpha*(1-self.exp()).relu()

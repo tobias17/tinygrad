@@ -48,7 +48,7 @@ def get_state_dict(obj, prefix:str='', tensor_type=Tensor) -> Dict[str, Tensor]:
   return state_dict
 def get_parameters(obj) -> List[Tensor]: return list(get_state_dict(obj).values())
 
-def load_state_dict(model, state_dict, strict=True, verbose=True):
+def load_state_dict(model, state_dict, strict=True, verbose=True, reshape=False, fp16=False):
   with Timing("loaded weights in ", lambda et_ns: f", {GlobalCounters.mem_used/1e9:.2f} GB loaded at {GlobalCounters.mem_used/et_ns:.2f} GB/s"):
     model_state_dict = get_state_dict(model)
     if DEBUG >= 1 and len(state_dict) > len(model_state_dict): print("WARNING: unused weights in state_dict", sorted(list(state_dict.keys() - model_state_dict.keys())))
@@ -57,7 +57,11 @@ def load_state_dict(model, state_dict, strict=True, verbose=True):
       if k not in state_dict and not strict:
         if DEBUG >= 1: print(f"WARNING: not loading {k}")
         continue
-      v.assign(state_dict[k].to(v.device)).realize()
+      w: Tensor = state_dict[k].to(v.device)
+      if reshape and w.shape != v.shape and prod(w.shape) == prod(v.shape):
+        if DEBUG >= 1: print(f"WARNING: reshaping {w.shape} -> {v.shape} for {k}")
+        w = w.reshape(v.shape)
+      v.assign((w.cast(dtypes.float16) if fp16 else w).realize())
 
 # torch support!
 

@@ -5,12 +5,12 @@ from pathlib import Path
 import gzip, argparse, math, re
 from functools import lru_cache
 from collections import namedtuple
-from typing import List, Union
+from typing import List, Union, Dict
 
 from tqdm import tqdm
 from tinygrad.tensor import Tensor
 from tinygrad import Device
-from tinygrad.helpers import dtypes, GlobalCounters, Timing, Context, getenv, fetch
+from tinygrad.helpers import dtypes, GlobalCounters, Timing, Context, getenv, fetch, DEBUG, prod
 from tinygrad.nn import Conv2d, Linear, GroupNorm, LayerNorm, Embedding
 from tinygrad.nn.state import torch_load, load_state_dict, get_state_dict
 from tinygrad.jit import TinyJit
@@ -255,12 +255,6 @@ def timestep_embedding(timesteps, dim, max_period=10000):
   args = timesteps * freqs
   return Tensor.cat(args.cos(), args.sin()).reshape(1, -1)
 
-MODEL_PARAMS = {
-  "1":  { "dim": 320, "context_dim":  768, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4,4], "attn_levels": [0,1,2],   "n_heads":  8 },
-  "2":  { "dim": 320, "context_dim": 1024, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4,4], "attn_levels": [0,1,2,3], "d_head":  64 },
-  "XL": { "dim": 320, "context_dim": 2048, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4],   "attn_levels": [1,2],     "d_head":  64 },
-}
-
 class UNetModel:
   def __init__(self, dim, context_dim, in_channels, out_channels, channel_mult, attn_levels, n_heads=-1, d_head=-1):
     tch = dim*4
@@ -302,12 +296,12 @@ class UNetModel:
     self.output_blocks: List[List[Union[ResBlock,SpatialTransformer,Upsample]]] = []
     for level, mult in list(enumerate(channel_mult))[::-1]:
       for i in range(3):
-        ich = input_channels.pop()
+        pch, ch, ich = ch, dim*mult, input_channels.pop()
         n_heads, d_head = (ch//d_head, d_head) if n_heads==-1 else (n_heads, ch//n_heads)
         self.output_blocks.append([
-          ResBlock(ch+ich, tch, dim*mult),
+          ResBlock(pch+ich, tch, dim*mult),
           *([SpatialTransformer(ch, context_dim, n_heads, d_head)] if level in attn_levels else []),
-          *([Upsample(ch)] if (i==2 and level<len(channel_mult)-1) else [])
+          *([Upsample(ch)] if (i==2 and level>0) else [])
         ])
 
     self.out = [
@@ -527,11 +521,18 @@ class ClipTokenizer:
     return [49406] + bpe_tokens + [49407] * (77 - len(bpe_tokens) - 1)
 
 class StableDiffusion:
-  def __init__(self):
+  def __init__(self, dm_params:Dict, make_cond_model, is_legacy:bool=True):
     self.alphas_cumprod = Tensor.empty(1000)
-    self.model = namedtuple("DiffusionModel", ["diffusion_model"])(diffusion_model = UNetModel())
+    self.model = namedtuple("DiffusionModel", ["diffusion_model"])(diffusion_model = UNetModel(**dm_params))
     self.first_stage_model = AutoencoderKL()
-    self.cond_stage_model = namedtuple("CondStageModel", ["transformer"])(transformer = namedtuple("Transformer", ["text_model"])(text_model = CLIPTextTransformer()))
+    self.cond_stage_model = make_cond_model()
+    self.is_legacy = is_legacy
+
+  def make_condition_from(self, tokens:Tensor) -> Tensor:
+    if self.is_legacy:
+      return self.cond_stage_model.transformer.text_model(tokens)
+    else:
+      return self.cond_stage_model.model(tokens)
 
   def get_x_prev_and_pred_x0(self, x, e_t, a_t, a_prev):
     temperature = 1
@@ -588,8 +589,32 @@ class StableDiffusion:
 # ** ldm.modules.encoders.modules.FrozenCLIPEmbedder
 # cond_stage_model.transformer.text_model
 
+MODEL_CONFIGS: Dict[str,Dict] = {
+  "1": {
+    "fetcher": lambda: fetch('https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt', 'sd-v1-4.ckpt'),
+    "init": {
+      "dm_params": { "dim": 320, "context_dim":  768, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4,4], "attn_levels": [0,1,2], "n_heads": 8 },
+      "make_cond_model": lambda: namedtuple("CondStageModel", ["transformer"])(transformer = namedtuple("Transformer", ["text_model"])(text_model = CLIPTextTransformer())), # type: ignore
+      "is_legacy": True,
+    }
+  },
+  "2": {
+    "fetcher": lambda: fetch('https://huggingface.co/stabilityai/stable-diffusion-2-1-base/resolve/main/v2-1_512-ema-pruned.ckpt', 'v2-1_512-ema-pruned.ckpt'),
+    "init": {
+      "dm_params": { "dim": 320, "context_dim": 1024, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4,4], "attn_levels": [0,1,2,3], "d_head": 64 },
+    }
+  },
+  "XL": {
+    "fetcher": lambda: None,
+    "init": {
+      "dm_params": { "dim": 320, "context_dim": 2048, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4], "attn_levels": [1,2], "d_head": 64 },
+    }
+  },
+}
+
 if __name__ == "__main__":
   parser = argparse.ArgumentParser(description='Run Stable Diffusion', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+  parser.add_argument('--version', type=str, default='1', choices=list(MODEL_CONFIGS.keys()))
   parser.add_argument('--steps', type=int, default=5, help="Number of steps in diffusion")
   parser.add_argument('--prompt', type=str, default="a horse sized cat eating a bagel", help="Phrase to render")
   parser.add_argument('--out', type=str, default=Path(tempfile.gettempdir()) / "rendered.png", help="Output filename")
@@ -600,24 +625,24 @@ if __name__ == "__main__":
   parser.add_argument('--guidance', type=float, default=7.5, help="Prompt strength")
   args = parser.parse_args()
 
+  # args.version = "1"
+  config = MODEL_CONFIGS[args.version]
+
   Tensor.no_grad = True
-  model = StableDiffusion()
+  model = StableDiffusion(**config["init"])
 
   # load in weights
-  load_state_dict(model, torch_load(fetch('https://huggingface.co/CompVis/stable-diffusion-v-1-4-original/resolve/main/sd-v1-4.ckpt', 'sd-v1-4.ckpt'))['state_dict'], strict=False)
-
-  if args.fp16:
-    for l in get_state_dict(model).values():
-      l.assign(l.cast(dtypes.float16).realize())
+  # cond_keys = [k for k in torch_load(config["fetcher"]())['state_dict'] if k.startswith("cond")]
+  load_state_dict(model, torch_load(config["fetcher"]())['state_dict'], verbose=True, strict=True, reshape=True, fp16=args.fp16)
 
   # run through CLIP to get context
   tokenizer = ClipTokenizer()
   prompt = Tensor([tokenizer.encode(args.prompt)])
-  context = model.cond_stage_model.transformer.text_model(prompt).realize()
+  context = model.make_condition_from(prompt).realize()
   print("got CLIP context", context.shape)
 
   prompt = Tensor([tokenizer.encode("")])
-  unconditional_context = model.cond_stage_model.transformer.text_model(prompt).realize()
+  unconditional_context = model.make_condition_from(prompt).realize()
   print("got unconditional CLIP context", unconditional_context.shape)
 
   # done with clip model
