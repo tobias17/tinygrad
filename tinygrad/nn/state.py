@@ -57,6 +57,8 @@ def load_state_dict(model, state_dict, strict=True, verbose=True, reshape=False,
       if k not in state_dict and not strict:
         if DEBUG >= 1: print(f"WARNING: not loading {k}")
         continue
+      if k not in state_dict and any(k.endswith(f"norm.{v}") for v in ("weight","bias")):
+        continue # FIXME: remove
       w: Tensor = state_dict[k].to(v.device)
       if reshape and w.shape != v.shape and prod(w.shape) == prod(v.shape):
         if DEBUG >= 1: print(f"WARNING: reshaping {w.shape} -> {v.shape} for {k}")

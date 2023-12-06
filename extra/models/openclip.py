@@ -1,15 +1,18 @@
+# NOTE: this architecture was adapted from https://github.com/mlfoundations/open_clip/blob/main/src/open_clip/model.py and its internal imports
+# License: https://github.com/mlfoundations/open_clip/blob/main/LICENSE
+
 from tinygrad.tensor import Tensor
 from tinygrad.nn import LayerNorm, Linear, Conv2d, Embedding
 from collections import OrderedDict
 from typing import List, Callable, Optional, Tuple
 
 CLIP_CONFIGS = {
-  "ViT-H-14.json": {
+  "ViT-H-14": {
     "embed_dim":  1024,
     "vision_cfg": { "image_size": 224, "layers": 32, "width": 1280, "head_width": 80, "patch_size": 14 },
     "text_cfg":   { "context_length": 77, "vocab_size": 49408, "width": 1024, "heads": 16, "layers": 24 }
   },
-  "ViT-bigG-14.json": {
+  "ViT-bigG-14": {
     "embed_dim":  1280,
     "vision_cfg": { "image_size": 224, "layers": 48, "width": 1664, "head_width": 104, "patch_size": 14, "mlp_ratio": 4.9231 },
     "text_cfg":   { "context_length": 77, "vocab_size": 49408, "width": 1280, "heads": 20, "layers": 32 }
@@ -19,20 +22,21 @@ CLIP_CONFIGS = {
 def identity(x:Tensor) -> Tensor: return x
 
 class MultiheadAttention:
-  def __init__(self, embed_dim:int, n_heads:int, is_causal:bool):
-    self.to_q = Linear(embed_dim, embed_dim, bias=False)
-    self.to_k = Linear(embed_dim, embed_dim, bias=False)
-    self.to_v = Linear(embed_dim, embed_dim, bias=False)
+  def __init__(self, dim:int, n_heads:int, is_causal:bool):
+    self.in_proj_weight = Tensor.zeros(dim*3, dim)
+    self.in_proj_bias   = Tensor.zeros(dim*3)
+    self.out_proj = Linear(dim, dim)
     self.n_heads = n_heads
-    self.d_head  = embed_dim // n_heads
-    assert embed_dim == n_heads * self.d_head
-    self.to_out: List[Callable[[Tensor],Tensor]] = [Linear(n_heads*self.d_head, embed_dim)]
+    self.d_head  = dim // n_heads
+    assert dim == n_heads * self.d_head
+    self.scale = self.d_head ** -0.5
     self.is_causal = is_causal
   def __call__(self, x:Tensor) -> Tensor:
-    q,k,v = self.to_q(x), self.to_v(x), self.to_v(x)
+    q,k,v = (x @ self.in_proj_weight.T + self.in_proj_bias).chunk(3, dim=-1)
     q,k,v = [y.reshape(x.shape[0], -1, self.n_heads, self.d_head).transpose(-3,-2) for y in (q,k,v)]
     attention = Tensor.scaled_dot_product_attention(q, k, v, is_causal=self.is_causal).transpose(-3,-2)
-    return attention.reshape(shape=(*x.shape[0:-2], -1, self.n_heads * self.d_head)).sequential(self.to_out)
+    x = attention.reshape(shape=(x.shape[0], -1, self.n_heads * self.d_head))
+    return self.out_proj(x)
 
 class ResidualAttentionBlock:
   def __init__(self, dims:int, n_heads:int, mlp_ratio:float, is_causal:bool):
@@ -49,8 +53,10 @@ class ResidualAttentionBlock:
     self.ls_2 = identity
   def __call__(self, x:Tensor) -> Tensor:
     h = self.ls_1(self.attn(self.ln_1(x)))
-    h = self.ls_2(self.ln_2(h).sequential(self.mlp))
-    return x + h
+    h = self.ln_2(h)
+    for k in self.mlp:
+      h = self.mlp[k](h) # type: ignore
+    return x + self.ls_2(h)
 
 class Transformer:
   def __init__(self, dims:int, layers:int, n_heads:int, mlp_ratio:float=4.0, is_causal:bool=False):
@@ -104,21 +110,54 @@ class OpenCLIP:
     self.positional_embedding = text.positional_embedding
     self.ln_final = text.ln_final
     self.text_projection = text.text_projection
-    self.logit_scale = Tensor.zeros(0)
+    self.logit_scale = Tensor.zeros()
 
-  def encode_image(self, image:Tensor, normalize:bool=False):
-    features = self.visual(image)
-    return features.normalize(dim=-1) if normalize else features
+  # NOTE: the following was adapted but never tested
 
-  def encode_text(self, text:Tensor, normalize:bool=False):
-    x = self.token_embedding(text)
-    x = x + self.positional_embedding
-    x = self.transformer(x.permute((1,0,2))).permute((1,0,2))
-    x = self.ln_final(x)
-    x = x[Tensor.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection # type: ignore
-    return x.normalize(dim=-1) if normalize else x
+  # def encode_image(self, image:Tensor, normalize:bool=False):
+  #   features = self.visual(image)
+  #   return features.normalize(dim=-1) if normalize else features
 
-  def __call__(self, image:Optional[Tensor]=None, text:Optional[Tensor]=None) -> Tuple[Tensor,Tensor,Tensor]:
-    image_features = self.encode_image(image, normalize=True) if image else None
-    text_features  = self.encode_text (text,  normalize=True) if text  else None
-    return image_features, text_features, self.logit_scale.exp()
+  # def encode_text(self, text:Tensor, normalize:bool=False):
+  #   x = self.token_embedding(text)
+  #   x = x + self.positional_embedding
+  #   x = self.transformer(x.permute((1,0,2))).permute((1,0,2))
+  #   x = self.ln_final(x)
+  #   x = x[Tensor.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection # type: ignore
+  #   return x.normalize(dim=-1) if normalize else x
+
+  # def __call__(self, image:Optional[Tensor]=None, text:Optional[Tensor]=None) -> Tuple[Tensor,Tensor,Tensor]:
+  #   image_features = self.encode_image(image, normalize=True) if image else None
+  #   text_features  = self.encode_text (text,  normalize=True) if text  else None
+  #   return image_features, text_features, self.logit_scale.exp()
+
+
+# NOTE: the following is adapted from https://github.com/Stability-AI/generative-models/blob/main/sgm/modules/encoders/modules.py (MIT)
+
+class FrozenOpenCLIPEmbedder:
+  def __init__(self, arch):
+    model = OpenCLIP(**CLIP_CONFIGS[arch])
+    del model.visual
+    self.model = model
+
+  # def encode_with_transformer(self, text:Tensor) -> Tensor:
+  #   x = self.model.token_embedding(text)
+  #   x = x + self.model.positional_embedding
+  #   x = self.model.transformer(x.permute((1,0,2))).permute((1,0,2))
+  #   return self.model.ln_final(x)
+
+  def encode_with_transformer(self, text):
+    x = self.model.token_embedding(text)  # [batch_size, n_ctx, d_model]
+    x = x + self.model.positional_embedding
+    x = x.permute(1, 0, 2)  # NLD -> LND
+    x = self.text_transformer_forward(x)
+    x = x.permute(1, 0, 2)  # LND -> NLD
+    x = self.model.ln_final(x)
+    return x
+
+  def text_transformer_forward(self, x:Tensor):
+    for i, r in enumerate(self.model.transformer.resblocks):
+      if i == len(self.model.transformer.resblocks) - 1:
+        break
+      x = r(x)
+    return x

@@ -14,6 +14,7 @@ from tinygrad.helpers import dtypes, GlobalCounters, Timing, Context, getenv, fe
 from tinygrad.nn import Conv2d, Linear, GroupNorm, LayerNorm, Embedding
 from tinygrad.nn.state import torch_load, load_state_dict, get_state_dict
 from tinygrad.jit import TinyJit
+from extra.models.openclip import FrozenOpenCLIPEmbedder
 
 class AttnBlock:
   def __init__(self, in_channels):
@@ -532,7 +533,7 @@ class StableDiffusion:
     if self.is_legacy:
       return self.cond_stage_model.transformer.text_model(tokens)
     else:
-      return self.cond_stage_model.model(tokens)
+      return self.cond_stage_model.encode_with_transformer(tokens)
 
   def get_x_prev_and_pred_x0(self, x, e_t, a_t, a_prev):
     temperature = 1
@@ -601,13 +602,17 @@ MODEL_CONFIGS: Dict[str,Dict] = {
   "2": {
     "fetcher": lambda: fetch('https://huggingface.co/stabilityai/stable-diffusion-2-1-base/resolve/main/v2-1_512-ema-pruned.ckpt', 'v2-1_512-ema-pruned.ckpt'),
     "init": {
-      "dm_params": { "dim": 320, "context_dim": 1024, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4,4], "attn_levels": [0,1,2,3], "d_head": 64 },
+      "dm_params": { "dim": 320, "context_dim": 1024, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4,4], "attn_levels": [0,1,2], "d_head": 64 },
+      "make_cond_model": lambda: FrozenOpenCLIPEmbedder(arch="ViT-H-14"),
+      "is_legacy": False,
     }
   },
   "XL": {
     "fetcher": lambda: None,
     "init": {
       "dm_params": { "dim": 320, "context_dim": 2048, "in_channels": 4, "out_channels": 4, "channel_mult": [1,2,4], "attn_levels": [1,2], "d_head": 64 },
+      "make_cond_model": lambda: FrozenOpenCLIPEmbedder(arch="ViT-bigG-14"),
+      "is_legacy": False,
     }
   },
 }
@@ -632,14 +637,29 @@ if __name__ == "__main__":
   model = StableDiffusion(**config["init"])
 
   # load in weights
-  # cond_keys = [k for k in torch_load(config["fetcher"]())['state_dict'] if k.startswith("cond")]
+  cond_keys = [k for k in torch_load(config["fetcher"]())['state_dict'] if k.startswith("cond")]
   load_state_dict(model, torch_load(config["fetcher"]())['state_dict'], verbose=True, strict=True, reshape=True, fp16=args.fp16)
 
   # run through CLIP to get context
   tokenizer = ClipTokenizer()
+  z = tokenizer.encode(args.prompt)
   prompt = Tensor([tokenizer.encode(args.prompt)])
   context = model.make_condition_from(prompt).realize()
   print("got CLIP context", context.shape)
+
+  ctx_np = context.numpy()
+  import numpy as np
+  ctx_hf = np.load(f"prompt_embeds_{args.version}.npy")
+
+  diff = np.abs(ctx_np - ctx_hf)
+  print(f"ours mean: {np.mean(np.abs(ctx_np))}")
+  print(f"ours std:  {np.std(np.abs(ctx_np))}")
+  print(f"hfs mean:  {np.mean(np.abs(ctx_hf))}")
+  print(f"hfs std:   {np.std(np.abs(ctx_hf))}")
+  print(f"diff mean: {np.mean(diff)}")
+  print(f"diff std:  {np.std(diff)}")
+
+  context = Tensor(ctx_hf)
 
   prompt = Tensor([tokenizer.encode("")])
   unconditional_context = model.make_condition_from(prompt).realize()
