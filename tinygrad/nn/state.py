@@ -69,7 +69,7 @@ def load_state_dict(model, state_dict, strict=True, verbose=True, reshape=False,
         continue # FIXME: remove
       w: Tensor = state_dict[k].to(v.device)
       if reshape and w.shape != v.shape and prod(w.shape) == prod(v.shape):
-        if DEBUG >= 1: print(f"WARNING: reshaping {w.shape} -> {v.shape} for {k}")
+        if DEBUG >= 2: print(f"WARNING: reshaping {w.shape} -> {v.shape} for {k}")
         w = w.reshape(v.shape)
       v.assign((w.cast(dtypes.float16) if fp16 else w).realize())
 

@@ -645,28 +645,30 @@ if __name__ == "__main__":
   load_state_dict(model, torch_load(config["fetcher"]())['state_dict'], verbose=True, strict=True, reshape=True, fp16=args.fp16)
 
   # run through CLIP to get context
-  tokenizer = ClipTokenizer()
-  z = tokenizer.encode(args.prompt)
-  prompt = Tensor([tokenizer.encode(args.prompt)])
-  context = model.make_condition_from(prompt).realize()
+  # tokenizer = ClipTokenizer()
+  # z = tokenizer.encode(args.prompt)
+  # prompt = Tensor([tokenizer.encode(args.prompt)])
+  # context = model.make_condition_from(prompt).realize()
+  context = Tensor(np.load(f"txt_emb_{args.version}.npy"))
   print("got CLIP context", context.shape)
 
-  ctx_np = context.numpy()
-  import numpy as np
-  ctx_hf = np.load(f"prompt_embeds_{args.version}.npy")
+  # ctx_np = context.numpy()
+  # import numpy as np
+  # ctx_hf = np.load(f"prompt_embeds_{args.version}.npy")
 
-  diff = np.abs(ctx_np - ctx_hf)
-  print(f"ours mean: {np.mean(np.abs(ctx_np))}")
-  print(f"ours std:  {np.std(np.abs(ctx_np))}")
-  print(f"hfs mean:  {np.mean(np.abs(ctx_hf))}")
-  print(f"hfs std:   {np.std(np.abs(ctx_hf))}")
-  print(f"diff mean: {np.mean(diff)}")
-  print(f"diff std:  {np.std(diff)}")
+  # diff = np.abs(ctx_np - ctx_hf)
+  # print(f"ours mean: {np.mean(np.abs(ctx_np))}")
+  # print(f"ours std:  {np.std(np.abs(ctx_np))}")
+  # print(f"hfs mean:  {np.mean(np.abs(ctx_hf))}")
+  # print(f"hfs std:   {np.std(np.abs(ctx_hf))}")
+  # print(f"diff mean: {np.mean(diff)}")
+  # print(f"diff std:  {np.std(diff)}")
 
-  context = Tensor(ctx_hf)
+  # context = Tensor(ctx_hf)
 
-  prompt = Tensor([tokenizer.encode("")])
-  unconditional_context = model.make_condition_from(prompt).realize()
+  # prompt = Tensor([tokenizer.encode("")])
+  # unconditional_context = model.make_condition_from(prompt).realize()
+  unconditional_context = Tensor(np.load(f"unc_emb_{args.version}.npy"))
   print("got unconditional CLIP context", unconditional_context.shape)
 
   # done with clip model
