@@ -81,9 +81,11 @@ class MultiLazyBuffer(MathTrait):
       return self.real_lbs[0].copy_to_device(device)
     # copy lbs to device, pad to final shape, and sum
     llbs:List[LazyBuffer] = []
-    for lb,real,(start,end) in zip(self.lbs, self.real, self.bounds):
+    bound_deltas = [end-start if r else 0 for r,(start,end) in zip(self.real, self.bounds)]
+    real_bounds = [(end-delta, end) for delta, end in zip(bound_deltas, itertools.accumulate(bound_deltas))]
+    for lb,real,(start,end) in zip(self.lbs, self.real, real_bounds):
       if not real: continue
-      pad_arg = tuple((0,0) if a != self.axis else (start, self.bounds[-1][1]-end) for a in range(len(lb.shape)))
+      pad_arg = tuple((0,0) if a != self.axis else (start, real_bounds[-1][1]-end) for a in range(len(lb.shape)))
       llbs.append(lb.copy_to_device(device).pad(pad_arg))
     return functools.reduce(lambda x,y: x.e(BinaryOps.ADD, y), llbs)
 
