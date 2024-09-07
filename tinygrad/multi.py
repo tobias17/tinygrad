@@ -81,9 +81,11 @@ class MultiLazyBuffer(MathTrait):
       return self.real_lbs[0].copy_to_device(device)
     # copy lbs to device, pad to final shape, and sum
     llbs:List[LazyBuffer] = []
-    for lb,real,(start,end) in zip(self.lbs, self.real, self.bounds):
+    bound_deltas = [end-start if r else 0 for r,(start,end) in zip(self.real, self.bounds)]
+    real_bounds = [(end-delta, end) for delta, end in zip(bound_deltas, itertools.accumulate(bound_deltas))]
+    for lb,real,(start,end) in zip(self.lbs, self.real, real_bounds):
       if not real: continue
-      pad_arg = tuple((0,0) if a != self.axis else (start, self.bounds[-1][1]-end) for a in range(len(lb.shape)))
+      pad_arg = tuple((0,0) if a != self.axis else (start, real_bounds[-1][1]-end) for a in range(len(lb.shape)))
       llbs.append(lb.copy_to_device(device).pad(pad_arg))
     return functools.reduce(lambda x,y: x.e(BinaryOps.ADD, y), llbs)
 
@@ -165,12 +167,12 @@ class MultiLazyBuffer(MathTrait):
     return MultiLazyBuffer([x.permute(arg) for x in self.lbs], arg.index(self.axis) if self.axis is not None else None, self.real)
 
   def shrink(self, arg:Tuple[Tuple[sint, sint], ...]):
-    assert self.axis is None or arg[self.axis] == (0, self.shape[self.axis]) or arg[self.axis] in self.bounds, f"shrinking not supported for {arg=}"
+    assert self.axis is None or arg[self.axis] == (0, self.shape[self.axis]) or all(arg[self.axis][i] in [b[i] for b in self.bounds] for i in range(2)), f"shrinking not supported for {arg=}"
     if self.axis is not None and arg[self.axis] in self.bounds and arg[self.axis] != (0, self.shape[self.axis]):
       assert all(arg[i] == (0, s) or i == self.axis for i,s in enumerate(self.shape)), "cannot shrink sharded and non-sharded axis at the same time"
-      idx = self.bounds.index(arg[self.axis])
+      idxs = [i for i,(start,end) in enumerate(self.bounds) if start >= arg[self.axis][0] and end <= arg[self.axis][1]]
       # zero out other lbs to not create lb reference
-      return MultiLazyBuffer([lb if i==idx else lb.const_like(0) for i,lb in enumerate(self.lbs)], self.axis, [i==idx for i in range(len(self.lbs))])
+      return MultiLazyBuffer([lb if i in idxs else lb.const_like(0) for i,lb in enumerate(self.lbs)], self.axis, [i in idxs for i in range(len(self.lbs))])
     return MultiLazyBuffer([x.shrink(tuple((0, x.shape[self.axis]) if a == self.axis else s for a,s in enumerate(arg))) for x in self.lbs],
                            self.axis, self.real)
 
