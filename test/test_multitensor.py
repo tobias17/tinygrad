@@ -883,6 +883,58 @@ class TestBatchNorm(unittest.TestCase):
     assert synced_si
     assert unsynced_si
 
+def make_single_multi_tensors(shps, axis):
+  single = [Tensor.rand(shp) for shp in shps]
+  multi  = [y.shard(devices_2, axis=axis) for y in single]
+  if len(shps) == 1:
+    return single[0], multi[0]
+  return single, multi
+
+def compare_outputs(single:np.ndarray, multi:np.ndarray):
+  try:
+    assert single.shape == multi.shape, f"shape mismatch: single={single.shape} | multi={multi.shape}"
+    assert single.dtype == multi.dtype, f"dtype mismatch: single={single.dtype} | multi={multi.dtype}"
+    np.testing.assert_allclose(single, multi)
+  except Exception as e:
+    raise Exception(f"Failed shape {single.shape}: {e}")
+
+@unittest.skipIf(CI and Device.DEFAULT in ("GPU", "CUDA", "METAL"), "no GPU CI")
+class TestCatSplit(unittest.TestCase):
+  def test_cat(self):
+    singles, multis = make_single_multi_tensors([(4,4)]*2, axis=0)
+    compare_outputs(Tensor.cat(*singles).numpy(), Tensor.cat(*multis).numpy())
+
+  def test_chunk(self):
+    single_in, multi_in = make_single_multi_tensors([(8,4)], axis=0)
+    single_out = single_in.chunk(2)
+    multi_out  = multi_in.chunk(2)
+    assert len(single_out) == 2 and len(multi_out) == 2
+    for single, multi in zip(single_out, multi_out):
+      compare_outputs(single.numpy(), multi.numpy())
+  
+  def test_cat_chunk(self):
+    single_in,  multi_in  = make_single_multi_tensors([(4,4)]*2, axis=0)
+    single_cat, multi_cat = Tensor.cat(*single_in), Tensor.cat(*multi_in)
+    single_out, multi_out = single_cat.chunk(2), multi_cat.chunk(2)
+    for single, multi in zip(single_out, multi_out):
+      compare_outputs(single.numpy(), multi.numpy())
+
+  def test_multiple_cat_chunk_cycles(self):
+    single_list, multi_list = make_single_multi_tensors([(4,4)]*2, axis=0)
+    for _ in range(10):
+      single_add, multi_add = make_single_multi_tensors([(8,4)], axis=None)
+      single_sub, multi_sub = make_single_multi_tensors([(4,4)]*2, axis=None)
+
+      single_cat  = Tensor.cat(*single_list) + single_add
+      single_list = [i-s for i,s in zip(single_cat.chunk(2), single_sub)]
+
+      multi_cat  = Tensor.cat(*multi_list) + multi_add
+      multi_list = [i-s for i,s in zip(multi_cat.chunk(2), multi_sub)]
+
+    for single, multi in zip(single_list, multi_list):
+      compare_outputs(single.numpy(), multi.numpy())
+
+
 def helper_test_shard_op(shps, fxn, atol=1e-6, rtol=1e-3):
   for shp in shps:
     single_in = Tensor.randn(shp)

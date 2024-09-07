@@ -1105,6 +1105,9 @@ class Tensor:
     dim = self._resolve_dim(dim)
     assert all(len(y.shape) == len(self.shape) and all(y.shape[i] == s for i,s in enumerate(self.shape) if i != dim) for y in args)
     catargs = [self, *args]
+    if all(isinstance(y.lazydata, MultiLazyBuffer) and all(y.lazydata.real) and (y.lazydata.axis == dim) for y in catargs) \
+        and all(len(self.shape) == len(y.shape) and self.dtype == y.dtype and all(y.shape[i] == s for i,s in enumerate(self.shape)) for y in args):
+      return Tensor(MultiLazyBuffer(list(lb for y in catargs for lb in y.lazydata.lbs), dim), tuple(dev for y in catargs for dev in y.device), self.dtype)
     cat_dims = [s.shape[dim] for s in catargs]
     cat_dim_cumsum = [0, *itertools.accumulate(cat_dims)]
     slc:List[List[Optional[Tuple[sint, sint]]]] = [[None for _ in self.shape] for _ in catargs]
@@ -1187,6 +1190,21 @@ class Tensor:
     dim = self._resolve_dim(dim)
     if isinstance(sizes, int): sizes = [min(sizes, self.shape[dim]-i) for i in range(0, max(1, self.shape[dim]), max(1, sizes))]
     assert sum(sizes) == self.shape[dim], f"expect sizes to sum exactly to {self.shape[dim]}, but got {sum(sizes)}"
+    if isinstance(self.lazydata, MultiLazyBuffer) and self.lazydata.axis is not None and self.lazydata.axis == dim:
+      slices: List[List[int]] = []
+      count, sz_idx = 0, 0
+      for lb_idx,(start,end) in enumerate(self.lazydata.bounds):
+        if count == 0:
+          slices.append([lb_idx,lb_idx])
+          count += sizes[sz_idx]
+          sz_idx += 1
+          if sz_idx > len(sizes): break
+        slices[-1][1] = lb_idx+1
+        count -= (end - start)
+        if count < 0: break
+      else:
+        assert count == 0 and sz_idx == len(sizes) and len(sizes) == len(slices)
+        return tuple(Tensor(MultiLazyBuffer(self.lazydata.lbs[slice(*s)], dim), self.device[slice(*s)], self.dtype, self.requires_grad) for s in slices)
     return tuple(self[sl] for sl in [tuple([slice(None)]*dim + [slice(sum(sizes[:i]), sum(sizes[:i + 1]))]) for i in range(len(sizes))])
 
   def chunk(self, chunks:int, dim:int=0) -> List[Tensor]:
