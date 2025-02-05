@@ -16,6 +16,9 @@ class ModelConfig:
   norm_eps: float = 1e-5
   rope_theta: float = 100000000.0
 
+  def get_head_dim(self) -> int:
+    return self.head_dim if self.head_dim is not None else self.dim // self.n_heads
+
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
   freqs = 1.0 / (theta ** (Tensor.arange(0, dim, 2)[:(dim // 2)] / dim))
@@ -49,7 +52,7 @@ class Attention:
   def __init__(self, cfg:ModelConfig, linear=nn.Linear):
     self.n_heads = cfg.n_heads
     self.n_kv_heads = cfg.n_kv_heads if cfg.n_kv_heads is not None else cfg.n_heads # n_kv_heads != n_heads implies MQA [arxiv/2307.09288, A.2.1]
-    self.head_dim = cfg.head_dim if cfg.head_dim is not None else cfg.dim // cfg.n_heads
+    self.head_dim = cfg.get_head_dim()
     self.n_rep = self.n_heads // self.n_kv_heads
     self.max_context = cfg.max_context
 
@@ -173,7 +176,7 @@ class Transformer:
     self.tok_embeddings = nn.Embedding(cfg.vocab_size, cfg.dim)
     self.output = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
     self.max_context = cfg.max_context
-    self.freqs_cis = precompute_freqs_cis(cfg.dim // cfg.n_heads, self.max_context * 2, cfg.rope_theta).contiguous()
+    self.freqs_cis = precompute_freqs_cis(cfg.get_head_dim(), self.max_context * 2, cfg.rope_theta).contiguous()
     self.forward_jit = TinyJit(self.forward) if jit else None
 
   def forward(self, tokens:Tensor, start_pos:Union[Variable,int], temperature:float, top_k:int, top_p:float, alpha_f:float, alpha_p:float):
