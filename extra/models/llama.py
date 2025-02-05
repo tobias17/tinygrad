@@ -1,6 +1,20 @@
 from typing import Tuple, Union, Optional, Dict, Any
 from tinygrad import Tensor, Variable, TinyJit, dtypes, nn, Device
 from tinygrad.helpers import getenv
+from dataclasses import dataclass
+
+@dataclass
+class ModelConfig:
+  dim: int
+  hidden_dim: int
+  n_layers: int
+  vocab_size: int
+  max_context: int
+  n_heads: int
+  head_dim: Optional[int] = None
+  n_kv_heads: Optional[int] = None
+  norm_eps: float = 1e-5
+  rope_theta: float = 100000000.0
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
@@ -32,17 +46,18 @@ def repeat_kv(x:Tensor, n_rep:int) -> Tensor:
   return x.repeat((1, 1, 1, n_rep)).reshape(bs, seqlen, n_kv_heads * n_rep, head_dim)
 
 class Attention:
-  def __init__(self, dim, n_heads, n_kv_heads, max_context, linear=nn.Linear):
-    self.n_heads = n_heads
-    self.n_kv_heads = n_kv_heads if n_kv_heads is not None else n_heads # n_kv_heads != n_heads implies MQA [arxiv/2307.09288, A.2.1]
-    self.head_dim = dim // n_heads
+  def __init__(self, cfg:ModelConfig, linear=nn.Linear):
+    self.n_heads = cfg.n_heads
+    self.n_kv_heads = cfg.n_kv_heads if cfg.n_kv_heads is not None else cfg.n_heads # n_kv_heads != n_heads implies MQA [arxiv/2307.09288, A.2.1]
+    self.head_dim = cfg.head_dim if cfg.head_dim is not None else cfg.dim // cfg.n_heads
     self.n_rep = self.n_heads // self.n_kv_heads
-    self.max_context = max_context
+    self.max_context = cfg.max_context
 
-    self.wq = linear(dim, self.n_heads * self.head_dim, bias=False)
-    self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-    self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-    self.wo = linear(self.n_heads * self.head_dim, dim, bias=False)
+    # print(f"dim={dim}, n_heads={self.n_heads}, head_dim={self.head_dim}, mult={self.n_heads * self.head_dim}")
+    self.wq = linear(cfg.dim, self.n_heads * self.head_dim, bias=False)
+    self.wk = linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wv = linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wo = linear(self.n_heads * self.head_dim, cfg.dim, bias=False)
 
   def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Optional[Tensor]) -> Tensor:
     if getenv("WQKV"):
@@ -52,7 +67,7 @@ class Attention:
     else:
       xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-    xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
+    xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads,    self.head_dim)
     xk = xk.reshape(xk.shape[0], xk.shape[1], self.n_kv_heads, self.head_dim)
     xv = xv.reshape(xv.shape[0], xv.shape[1], self.n_kv_heads, self.head_dim)
 
@@ -68,7 +83,8 @@ class Attention:
 
     # update the cache
     assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"{xk.dtype=}, {xv.dtype=}, {self.cache_kv.dtype=}"
-    self.cache_kv.shrink((None, None, (start_pos, start_pos+seqlen), None, None)).assign(Tensor.stack(xk, xv)).realize()
+    assign = Tensor.stack(xk, xv).to(Device.DEFAULT).shard(self.cache_kv.device, axis=None)
+    self.cache_kv.shrink((None, None, (start_pos, start_pos+seqlen), None, None)).assign(assign).realize()
 
     keys = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xk
     values = self.cache_kv[1].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xv
@@ -89,11 +105,11 @@ class FeedForward:
     return self.w2(self.w1(x).silu() * self.w3(x)) # SwiGLU [arxiv/2002.05202, eq (5)]
 
 class TransformerBlock:
-  def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, max_context:int, linear=nn.Linear, feed_forward=FeedForward):
-    self.attention = Attention(dim, n_heads, n_kv_heads, max_context, linear)
-    self.feed_forward = feed_forward(dim, hidden_dim, linear)
-    self.attention_norm = nn.RMSNorm(dim, norm_eps)
-    self.ffn_norm = nn.RMSNorm(dim, norm_eps)
+  def __init__(self, cfg:ModelConfig, linear=nn.Linear, feed_forward=FeedForward):
+    self.attention = Attention(cfg, linear)
+    self.feed_forward = feed_forward(cfg.dim, cfg.hidden_dim, linear)
+    self.attention_norm = nn.RMSNorm(cfg.dim, cfg.norm_eps)
+    self.ffn_norm = nn.RMSNorm(cfg.dim, cfg.norm_eps)
 
   def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Optional[Tensor]):
     h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
@@ -151,13 +167,13 @@ def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
   return output_token
 
 class Transformer:
-  def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_layers:int, norm_eps:float, vocab_size, linear=nn.Linear, n_kv_heads=None, rope_theta=10000, max_context=1024, jit=True, feed_forward=FeedForward):
-    self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear, feed_forward=feed_forward) for _ in range(n_layers)]
-    self.norm = nn.RMSNorm(dim, norm_eps)
-    self.tok_embeddings = nn.Embedding(vocab_size, dim)
-    self.output = nn.Linear(dim, vocab_size, bias=False)
-    self.max_context = max_context
-    self.freqs_cis = precompute_freqs_cis(dim // n_heads, self.max_context * 2, rope_theta).contiguous()
+  def __init__(self, cfg:ModelConfig, linear=nn.Linear, jit=True, feed_forward=FeedForward):
+    self.layers = [TransformerBlock(cfg, linear, feed_forward=feed_forward) for _ in range(cfg.n_layers)]
+    self.norm = nn.RMSNorm(cfg.dim, cfg.norm_eps)
+    self.tok_embeddings = nn.Embedding(cfg.vocab_size, cfg.dim)
+    self.output = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+    self.max_context = cfg.max_context
+    self.freqs_cis = precompute_freqs_cis(cfg.dim // cfg.n_heads, self.max_context * 2, cfg.rope_theta).contiguous()
     self.forward_jit = TinyJit(self.forward) if jit else None
 
   def forward(self, tokens:Tensor, start_pos:Union[Variable,int], temperature:float, top_k:int, top_p:float, alpha_f:float, alpha_p:float):
