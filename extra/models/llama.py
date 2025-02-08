@@ -1,6 +1,6 @@
-from typing import Tuple, Union, Optional, Dict, Any
+from typing import Tuple, Union, Optional, Dict, Any, List
 from tinygrad import Tensor, Variable, TinyJit, dtypes, nn, Device
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, tqdm
 from dataclasses import dataclass
 
 @dataclass
@@ -117,8 +117,18 @@ class TransformerBlock:
     h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
     return (h + self.feed_forward(self.ffn_norm(h))).contiguous()
 
+@dataclass
+class SampleParams:
+  temperature: float
+  top_k: int
+  top_p: float
+  alpha_f: float
+  alpha_p: float
+
 # standard openai sampling
-def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
+def sample(logits: Tensor, sp:SampleParams):
+  temp, k, p, af, ap = sp.temperature, sp.top_k, sp.top_p, sp.alpha_f, sp.alpha_p
+
   assert logits.ndim == 1, "only works on 1d tensors"
   assert 0 <= p <= 1, "p must be between 0 and 1"
   assert 0 <= k <= logits.numel(), "k must be between 0 and numel"
@@ -169,16 +179,18 @@ def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
   return output_token
 
 class Transformer:
-  def __init__(self, cfg:ModelConfig, linear=nn.Linear, jit=True, feed_forward=FeedForward):
+  def __init__(self, cfg:ModelConfig, linear=nn.Linear, feed_forward=FeedForward):
     self.layers = [TransformerBlock(cfg, linear, feed_forward=feed_forward) for _ in range(cfg.n_layers)]
     self.norm = nn.RMSNorm(cfg.dim, cfg.norm_eps)
     self.tok_embeddings = nn.Embedding(cfg.vocab_size, cfg.dim)
     self.output = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
     self.max_context = cfg.max_context
     self.freqs_cis = precompute_freqs_cis(cfg.get_head_dim(), self.max_context * 2, cfg.rope_theta).contiguous()
-    self.forward_jit = TinyJit(self.forward) if jit else None
+    self.forward_jit = TinyJit(self.forward)
 
-  def forward(self, tokens:Tensor, start_pos:Union[Variable,int], temperature:float, top_k:int, top_p:float, alpha_f:float, alpha_p:float):
+    self.cache_tokens: List[int] = []
+
+  def forward(self, tokens:Tensor, sample_params:SampleParams, start_pos:Union[Variable,int]) -> Tensor:
     _bsz, seqlen = tokens.shape
     h = self.tok_embeddings(tokens)
 
@@ -189,13 +201,34 @@ class Transformer:
     for layer in self.layers: h = layer(h, start_pos, freqs_cis, mask)
     logits = self.output(self.norm(h)).float()[:, -1, :]
 
-    return sample(logits.flatten(), temperature, top_k, top_p, alpha_f, alpha_p).realize()
+    return sample(logits.flatten(), sample_params).realize()
 
-  def __call__(self, tokens:Tensor, start_pos:int, temperature:float=0.0, top_k:int=0, top_p:float=0.8, alpha_f:float=0.0, alpha_p:float=0.0):
-    # TODO: better way to handle the first call v.s. the rest?
-    if tokens.shape[0:2] == (1,1) and self.forward_jit is not None and start_pos != 0:
-      return self.forward_jit(tokens, Variable("start_pos", 1, self.max_context).bind(start_pos), temperature, top_k, top_p, alpha_f, alpha_p)
-    return self.forward(tokens, start_pos, temperature, top_k, top_p, alpha_f, alpha_p)
+  def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sample_params:SampleParams):
+    assert (delta := len(tokens) - len(self.cache_tokens)) >= 0, f"Got fewer input tokens ({len(tokens)}) than tokens in the cache ({len(self.cache_tokens)})"
+    for i, (inp,cache) in enumerate(zip(tokens,self.cache_tokens)):
+      assert inp == cache, f"Token mismatch between input and cache at index {i}, {inp} != {cache}"
+
+    if len(self.cache_tokens) == 0:
+      self.cache_tokens.append(tokens[0])
+
+    for _ in tqdm(range(delta+1), disable=(delta==0)):
+      # Compute next token
+      start_pos = len(self.cache_tokens) - 1
+      curr_tok = tokens[start_pos]
+      ten_tok = Tensor([[curr_tok]], device=device).realize()
+      if start_pos == 0:
+        gen_tok = self.forward(ten_tok, sample_params, 0).item()
+      else:
+        gen_tok = self.forward_jit(ten_tok, sample_params, Variable("start_pos", 1, self.max_context).bind(start_pos)).item()
+
+      # Fill cache
+      if start_pos + 1 < len(tokens):
+        self.cache_tokens.append(tokens[start_pos + 1])
+      else:
+        self.cache_tokens.append(gen_tok) # type: ignore
+        return gen_tok
+
+    raise RuntimeError("Should not have gotten here")
 
 # *** helpers ***
 
