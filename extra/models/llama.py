@@ -88,7 +88,7 @@ class Attention:
     assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"{xk.dtype=}, {xv.dtype=}, {self.cache_kv.dtype=}"
     self.cache_kv.shrink((None, None, (start_pos, start_pos+seqlen), None, None)).assign(Tensor.stack(xk, xv)).realize()
 
-    keys = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xk
+    keys   = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xk
     values = self.cache_kv[1].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xv
 
     keys, values = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
@@ -117,66 +117,67 @@ class TransformerBlock:
     h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
     return (h + self.feed_forward(self.ffn_norm(h))).contiguous()
 
-@dataclass
-class SampleParams:
-  temperature: float
-  top_k: int
-  top_p: float
-  alpha_f: float
-  alpha_p: float
+class TokenSampler:
+  alpha_counter: Optional[Tensor] = None
+  def __init__(self, temperature:float, top_k:int, top_p:float, alpha_f:float, alpha_p:float):
+    self.temp = temperature
+    self.k = top_k
+    self.p = top_p
+    self.af = alpha_f
+    self.ap = alpha_p
 
-# standard openai sampling
-def sample(logits: Tensor, sp:SampleParams):
-  temp, k, p, af, ap = sp.temperature, sp.top_k, sp.top_p, sp.alpha_f, sp.alpha_p
+  # standard openai sampling
+  @TinyJit
+  def __call__(self, logits: Tensor):
+    assert logits.ndim == 1, "only works on 1d tensors"
+    assert 0 <= self.p <= 1, "p must be between 0 and 1"
+    assert 0 <= self.k <= logits.numel(), "k must be between 0 and numel"
 
-  assert logits.ndim == 1, "only works on 1d tensors"
-  assert 0 <= p <= 1, "p must be between 0 and 1"
-  assert 0 <= k <= logits.numel(), "k must be between 0 and numel"
+    # if temperature is very low just use argmax
+    if self.temp < 1e-6: return logits.argmax()
 
-  # if temperature is very low just use argmax
-  if temp < 1e-6: return logits.argmax()
+    logits = logits.to(Device.DEFAULT)
 
-  logits = logits.to(Device.DEFAULT)
+    # alpha sampling
+    if self.af or self.ap:
+      if self.alpha_counter is None:
+        self.alpha_counter = Tensor.zeros_like(logits, dtype=dtypes.int32).contiguous()
+      logits = logits - (self.alpha_counter * self.af + (self.alpha_counter > 0) * self.ap)
 
-  # alpha sampling
-  if af or ap:
-    if not hasattr(sample, "alpha_counter"):
-      setattr(sample, "alpha_counter", Tensor.zeros_like(logits, dtype=dtypes.int32).contiguous())
-    logits = logits - (sample.alpha_counter * af + (sample.alpha_counter > 0) * ap)
+    # replace NaNs with -inf
+    logits = (logits != logits).where(-float("inf"), logits)
 
-  # replace NaNs with -inf
-  logits = (logits != logits).where(-float("inf"), logits)
+    # softmax
+    t = (logits / self.temp).softmax()
 
-  # softmax
-  t = (logits / temp).softmax()
+    counter, counter2 = Tensor.arange(t.numel(), device=logits.device).contiguous(), Tensor.arange(t.numel() - 1, -1, -1, device=logits.device).contiguous()
+    # top k
+    if self.k:
+      output, output_indices = Tensor.zeros(self.k, device=logits.device).contiguous(), Tensor.zeros(self.k, device=logits.device, dtype=dtypes.int32).contiguous()
+      for i in range(self.k):
+        t_argmax = (t.numel() - ((t == (t_max := t.max())) * counter2).max() - 1).cast(dtypes.default_int)
+        output = output + t_max.unsqueeze(0).pad(((i, self.k - i - 1),))
+        output_indices = output_indices + t_argmax.unsqueeze(0).pad(((i, self.k - i - 1),))
+        t = (counter == t_argmax).where(0, t)
 
-  counter, counter2 = Tensor.arange(t.numel(), device=logits.device).contiguous(), Tensor.arange(t.numel() - 1, -1, -1, device=logits.device).contiguous()
-  # top k
-  if k:
-    output, output_indices = Tensor.zeros(k, device=logits.device).contiguous(), Tensor.zeros(k, device=logits.device, dtype=dtypes.int32).contiguous()
-    for i in range(k):
-      t_argmax = (t.numel() - ((t == (t_max := t.max())) * counter2).max() - 1).cast(dtypes.default_int)
-      output = output + t_max.unsqueeze(0).pad(((i, k - i - 1),))
-      output_indices = output_indices + t_argmax.unsqueeze(0).pad(((i, k - i - 1),))
-      t = (counter == t_argmax).where(0, t)
+      # approximate top p
+      # because we are already limited to top k elements we can do top p "without sorting"
+      output_cumsum = output[::-1].cumsum()[::-1] + t.sum()
+      output = (output_cumsum >= (1 - self.p)) * output
+      output_indices = (output_cumsum >= (1 - self.p)) * output_indices
 
-    # approximate top p
-    # because we are already limited to top k elements we can do top p "without sorting"
-    output_cumsum = output[::-1].cumsum()[::-1] + t.sum()
-    output = (output_cumsum >= (1 - p)) * output
-    output_indices = (output_cumsum >= (1 - p)) * output_indices
+      # sample
+      output_idx = output.multinomial()
+      output_token = output_indices[output_idx]
+    else:
+      output_token = t.multinomial()
 
-    # sample
-    output_idx = output.multinomial()
-    output_token = output_indices[output_idx]
-  else:
-    output_token = t.multinomial()
+    # increase alpha counter
+    if self.af or self.ap:
+      assert self.alpha_counter is not None
+      self.alpha_counter = (counter == output_token).where(self.alpha_counter + 1, self.alpha_counter)
 
-  # increase alpha counter
-  if af or ap:
-    sample.alpha_counter = (counter == output_token).where(sample.alpha_counter + 1, sample.alpha_counter)
-
-  return output_token
+    return output_token
 
 class Transformer:
   def __init__(self, cfg:ModelConfig, linear=nn.Linear, feed_forward=FeedForward):
@@ -190,7 +191,7 @@ class Transformer:
 
     self.cache_tokens: List[int] = []
 
-  def forward(self, tokens:Tensor, sample_params:SampleParams, start_pos:Union[Variable,int]) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:Union[Variable,int]) -> Tensor:
     _bsz, seqlen = tokens.shape
     h = self.tok_embeddings(tokens)
 
@@ -201,25 +202,35 @@ class Transformer:
     for layer in self.layers: h = layer(h, start_pos, freqs_cis, mask)
     logits = self.output(self.norm(h)).float()[:, -1, :]
 
-    return sample(logits.flatten(), sample_params).realize()
+    return logits.flatten().realize()
 
-  def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sample_params:SampleParams):
+  def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler):
     assert (delta := len(tokens) - len(self.cache_tokens)) >= 0, f"Got fewer input tokens ({len(tokens)}) than tokens in the cache ({len(self.cache_tokens)})"
     for i, (inp,cache) in enumerate(zip(tokens,self.cache_tokens)):
       assert inp == cache, f"Token mismatch between input and cache at index {i}, {inp} != {cache}"
 
     if len(self.cache_tokens) == 0:
       self.cache_tokens.append(tokens[0])
+    # else:
+    #   print()
+    #   l1 = self.forward(Tensor([[tokens[-1]]], device=device).realize(), sample_params, Variable("start_pos", 1, self.max_context).bind(len(self.cache_tokens) - 1), direct=True)
+    #   print(l1.shape, l1.numpy())
+    #   l2 = self.forward(Tensor([tokens], device=device), sample_params, 0, direct=True)
+    #   print(l2.shape, l2.numpy())
+    #   delta = (l1 - l2).abs().realize()
+    #   print(f"mean: {delta.mean().item()}")
+    #   print(f"max:  {delta.max().item()}")
+    #   import sys; sys.exit(0)
 
     for _ in tqdm(range(delta+1), disable=(delta==0)):
       # Compute next token
       start_pos = len(self.cache_tokens) - 1
-      curr_tok = tokens[start_pos]
-      ten_tok = Tensor([[curr_tok]], device=device).realize()
+      ten_tok = Tensor([[tokens[start_pos]]], device=device).realize()
       if start_pos == 0:
-        gen_tok = self.forward(ten_tok, sample_params, 0).item()
+        logits = self.forward(ten_tok, 0)
       else:
-        gen_tok = self.forward_jit(ten_tok, sample_params, Variable("start_pos", 1, self.max_context).bind(start_pos)).item()
+        logits = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos))
+      gen_tok = sampler(logits).item()
 
       # Fill cache
       if start_pos + 1 < len(tokens):
