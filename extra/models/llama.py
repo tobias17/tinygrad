@@ -86,8 +86,7 @@ class Attention:
 
     # update the cache
     assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"{xk.dtype=}, {xv.dtype=}, {self.cache_kv.dtype=}"
-    assign = Tensor.stack(xk, xv).to(Device.DEFAULT).shard(self.cache_kv.device, axis=None)
-    self.cache_kv.shrink((None, None, (start_pos, start_pos+seqlen), None, None)).assign(assign).realize()
+    self.cache_kv.shrink((None, None, (start_pos, start_pos+seqlen), None, None)).assign(Tensor.stack(xk, xv)).realize()
 
     keys = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xk
     values = self.cache_kv[1].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xv
