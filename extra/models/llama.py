@@ -128,7 +128,7 @@ class TokenSampler:
 
   # standard openai sampling
   @TinyJit
-  def __call__(self, logits: Tensor):
+  def __call__(self, logits: Tensor) -> Tensor:
     assert logits.ndim == 1, "only works on 1d tensors"
     assert 0 <= self.p <= 1, "p must be between 0 and 1"
     assert 0 <= self.k <= logits.numel(), "k must be between 0 and numel"
@@ -204,23 +204,16 @@ class Transformer:
 
     return logits.flatten().realize()
 
-  def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler):
+  def generate_bulk(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
+    return sampler(self.forward(Tensor([tokens], device=device).realize(), 0)).item()
+
+  def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
     assert (delta := len(tokens) - len(self.cache_tokens)) >= 0, f"Got fewer input tokens ({len(tokens)}) than tokens in the cache ({len(self.cache_tokens)})"
     for i, (inp,cache) in enumerate(zip(tokens,self.cache_tokens)):
       assert inp == cache, f"Token mismatch between input and cache at index {i}, {inp} != {cache}"
 
     if len(self.cache_tokens) == 0:
       self.cache_tokens.append(tokens[0])
-    # else:
-    #   print()
-    #   l1 = self.forward(Tensor([[tokens[-1]]], device=device).realize(), sample_params, Variable("start_pos", 1, self.max_context).bind(len(self.cache_tokens) - 1), direct=True)
-    #   print(l1.shape, l1.numpy())
-    #   l2 = self.forward(Tensor([tokens], device=device), sample_params, 0, direct=True)
-    #   print(l2.shape, l2.numpy())
-    #   delta = (l1 - l2).abs().realize()
-    #   print(f"mean: {delta.mean().item()}")
-    #   print(f"max:  {delta.max().item()}")
-    #   import sys; sys.exit(0)
 
     for _ in tqdm(range(delta+1), disable=(delta==0)):
       # Compute next token
