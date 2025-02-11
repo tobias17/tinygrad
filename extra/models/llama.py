@@ -127,7 +127,6 @@ class TokenSampler:
     self.ap = alpha_p
 
   # standard openai sampling
-  @TinyJit
   def __call__(self, logits: Tensor) -> Tensor:
     assert logits.ndim == 1, "only works on 1d tensors"
     assert 0 <= self.p <= 1, "p must be between 0 and 1"
@@ -191,7 +190,7 @@ class Transformer:
 
     self.cache_tokens: List[int] = []
 
-  def forward(self, tokens:Tensor, start_pos:Union[Variable,int]) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:Union[Variable,int], sampler:TokenSampler) -> Tensor:
     _bsz, seqlen = tokens.shape
     h = self.tok_embeddings(tokens)
 
@@ -202,10 +201,7 @@ class Transformer:
     for layer in self.layers: h = layer(h, start_pos, freqs_cis, mask)
     logits = self.output(self.norm(h)).float()[:, -1, :]
 
-    return logits.flatten().realize()
-
-  def generate_bulk(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
-    return sampler(self.forward(Tensor([tokens], device=device).realize(), 0)).item()
+    return sampler(logits.flatten()).realize()
 
   def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
     assert (delta := len(tokens) - len(self.cache_tokens)) >= 0, f"Got fewer input tokens ({len(tokens)}) than tokens in the cache ({len(self.cache_tokens)})"
@@ -220,10 +216,9 @@ class Transformer:
       start_pos = len(self.cache_tokens) - 1
       ten_tok = Tensor([[tokens[start_pos]]], device=device).realize()
       if start_pos == 0:
-        logits = self.forward(ten_tok, 0)
+        gen_tok = self.forward(ten_tok, 0, sampler).item()
       else:
-        logits = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos))
-      gen_tok = sampler(logits).item()
+        gen_tok = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler).item()
 
       # Fill cache
       if start_pos + 1 < len(tokens):
