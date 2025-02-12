@@ -15,6 +15,7 @@ class ModelConfig:
   n_kv_heads: Optional[int] = None
   norm_eps: float = 1e-5
   rope_theta: float = 100000000.0
+  shard_kvcache: Optional[int] = None
 
   def get_head_dim(self) -> int:
     return self.head_dim if self.head_dim is not None else self.dim // self.n_heads
@@ -55,8 +56,8 @@ class Attention:
     self.head_dim = cfg.get_head_dim()
     self.n_rep = self.n_heads // self.n_kv_heads
     self.max_context = cfg.max_context
+    self.shard_kvcache = cfg.shard_kvcache
 
-    # print(f"dim={dim}, n_heads={self.n_heads}, head_dim={self.head_dim}, mult={self.n_heads * self.head_dim}")
     self.wq = linear(cfg.dim, self.n_heads * self.head_dim, bias=False)
     self.wk = linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
     self.wv = linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
@@ -82,7 +83,7 @@ class Attention:
       self.cache_kv = Tensor.zeros(2, bsz, self.max_context, self.n_kv_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
       if isinstance(x.device, tuple):
         # TODO: instead of specifying how to shard, it can follow how xk and xv are being sharded
-        self.cache_kv.shard_((x.device), axis=3 if getenv("SHARD_KVCACHE") else None).realize()
+        self.cache_kv.shard_((x.device), axis=self.shard_kvcache).realize()
 
     # update the cache
     assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"{xk.dtype=}, {xv.dtype=}, {self.cache_kv.dtype=}"
@@ -252,9 +253,9 @@ def convert_from_huggingface(weights:dict[str, Tensor], model: Transformer, n_he
     if ".rotary_emb." in k: continue
     v = v.to(Device.DEFAULT)
     if "model.layers" in k:
-      if "q_proj" in k and permute_layers:
+      if "q_proj" in k and permute_layers and not k.endswith(".bias"):
         v = permute(v, n_heads)
-      elif "k_proj" in k and permute_layers:
+      elif "k_proj" in k and permute_layers and not k.endswith(".bias"):
         v = permute(v, n_kv_heads)
     sd[keymap[k]] = v
   return sd
