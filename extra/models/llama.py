@@ -87,6 +87,7 @@ class Attention:
 
     # update the cache
     assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"{xk.dtype=}, {xv.dtype=}, {self.cache_kv.dtype=}"
+    # assign = Tensor.stack(xk, xv).to(Device.DEFAULT).shard(self.cache_kv.device, axis=None)
     self.cache_kv.shrink((None, None, (start_pos, start_pos+seqlen), None, None)).assign(Tensor.stack(xk, xv)).realize()
 
     keys   = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xk
@@ -253,9 +254,9 @@ def convert_from_huggingface(weights:dict[str, Tensor], model: Transformer, n_he
     if ".rotary_emb." in k: continue
     v = v.to(Device.DEFAULT)
     if "model.layers" in k:
-      if "q_proj" in k and permute_layers and not k.endswith(".bias"):
+      if "q_proj" in k and permute_layers:
         v = permute(v, n_heads)
-      elif "k_proj" in k and permute_layers and not k.endswith(".bias"):
+      elif "k_proj" in k and permute_layers:
         v = permute(v, n_kv_heads)
     sd[keymap[k]] = v
   return sd
