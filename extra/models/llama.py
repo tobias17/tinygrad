@@ -204,14 +204,16 @@ class Transformer:
     return sampler(logits.flatten()).realize()
 
   def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
-    assert (delta := len(tokens) - len(self.cache_tokens)) >= 0, f"Got fewer input tokens ({len(tokens)}) than tokens in the cache ({len(self.cache_tokens)})"
+    assert len(tokens) >= len(self.cache_tokens), f"Got fewer input tokens ({len(tokens)}) than tokens in the cache ({len(self.cache_tokens)})"
     for i, (inp,cache) in enumerate(zip(tokens,self.cache_tokens)):
       assert inp == cache, f"Token mismatch between input and cache at index {i}, {inp} != {cache}"
 
     if len(self.cache_tokens) == 0:
       self.cache_tokens.append(tokens[0])
 
-    for _ in tqdm(range(delta+1), disable=(delta==0)):
+    total = len(tokens) - len(self.cache_tokens) + 1
+    it: tqdm = tqdm(total=total, disable=(total <= 1))
+    while True:
       # Compute next token
       start_pos = len(self.cache_tokens) - 1
       ten_tok = Tensor([[tokens[start_pos]]], device=device).realize()
@@ -221,13 +223,13 @@ class Transformer:
         gen_tok = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler).item()
 
       # Fill cache
+      it.update(1)
       if start_pos + 1 < len(tokens):
         self.cache_tokens.append(tokens[start_pos + 1])
       else:
+        assert isinstance(gen_tok, int)
         self.cache_tokens.append(gen_tok) # type: ignore
         return gen_tok
-
-    raise RuntimeError("Should not have gotten here")
 
 # *** helpers ***
 
