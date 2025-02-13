@@ -206,11 +206,11 @@ class Transformer:
     return sampler(logits.flatten()).realize()
 
   def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
-    assert len(tokens) >= len(self.cache_tokens), f"Got fewer input tokens ({len(tokens)}) than tokens in the cache ({len(self.cache_tokens)})"
-
     if len(self.cache_tokens) == 0:
       self.cache_tokens.append(tokens[0])
     else:
+      if len(tokens) < len(self.cache_tokens):
+        self.cache_tokens = self.cache_tokens[:len(tokens)]
       for i, (inp,cache) in enumerate(zip(tokens,self.cache_tokens)):
         if inp != cache:
           self.cache_tokens = self.cache_tokens[:i]
