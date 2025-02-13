@@ -207,11 +207,14 @@ class Transformer:
 
   def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
     assert len(tokens) >= len(self.cache_tokens), f"Got fewer input tokens ({len(tokens)}) than tokens in the cache ({len(self.cache_tokens)})"
-    for i, (inp,cache) in enumerate(zip(tokens,self.cache_tokens)):
-      assert inp == cache, f"Token mismatch between input and cache at index {i}, {inp} != {cache}"
 
     if len(self.cache_tokens) == 0:
       self.cache_tokens.append(tokens[0])
+    else:
+      for i, (inp,cache) in enumerate(zip(tokens,self.cache_tokens)):
+        if inp != cache:
+          self.cache_tokens = self.cache_tokens[:i]
+          break
 
     total = len(tokens) - len(self.cache_tokens) + 1
     it: tqdm = tqdm(total=total, disable=(total <= 1))
