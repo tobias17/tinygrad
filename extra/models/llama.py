@@ -129,7 +129,7 @@ class TokenSampler:
     self.ap = alpha_p
 
   # standard openai sampling
-  def __call__(self, logits: Tensor) -> Tensor:
+  def __call__(self, logits:Tensor, unif_samples:Tensor) -> Tensor:
     assert logits.ndim == 1, "only works on 1d tensors"
     assert 0 <= self.p <= 1, "p must be between 0 and 1"
     assert 0 <= self.k <= logits.numel(), "k must be between 0 and numel"
@@ -168,10 +168,10 @@ class TokenSampler:
       output_indices = (output_cumsum >= (1 - self.p)) * output_indices
 
       # sample
-      output_idx = output.multinomial()
+      output_idx = output.multinomial(unif_samples=unif_samples)
       output_token = output_indices[output_idx]
     else:
-      output_token = t.multinomial()
+      output_token = t.multinomial(unif_samples=unif_samples)
 
     # increase alpha counter
     if self.af or self.ap:
@@ -192,7 +192,7 @@ class Transformer:
 
     self.cache_tokens: List[int] = []
 
-  def forward(self, tokens:Tensor, start_pos:Union[Variable,int], sampler:TokenSampler) -> Tensor:
+  def forward(self, tokens:Tensor, start_pos:Union[Variable,int], sampler:TokenSampler, unif_samples:Tensor) -> Tensor:
     _bsz, seqlen = tokens.shape
     h = self.tok_embeddings(tokens)
 
@@ -203,7 +203,8 @@ class Transformer:
     for layer in self.layers: h = layer(h, start_pos, freqs_cis, mask)
     logits = self.output(self.norm(h)).float()[:, -1, :]
 
-    return sampler(logits.flatten()).realize()
+    # return logits.flatten().realize()
+    return sampler(logits.flatten(), unif_samples).realize()
 
   def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
     if len(self.cache_tokens) == 0:
@@ -222,10 +223,19 @@ class Transformer:
       # Compute next token
       start_pos = len(self.cache_tokens) - 1
       ten_tok = Tensor([[tokens[start_pos]]], device=device).realize()
+      unif_samples = Tensor.rand(1, 1, 1).realize()
       if start_pos == 0:
-        gen_tok = self.forward(ten_tok, 0, sampler).item()
+        # logits = self.forward(ten_tok, 0, sampler)
+        gen_tok = self.forward(ten_tok, 0, sampler, unif_samples).item()
       else:
-        gen_tok = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler).item()
+        # logits = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler)
+        gen_tok = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler, unif_samples).item()
+      
+      # # logits = logits.to(Device.DEFAULT).realize()
+      # # logits = (logits != logits).where(-float("inf"), logits).realize()
+      # # t = logits.softmax().realize()
+      # # gen_tok = t.multinomial().item()
+      # gen_tok = logits.argmax().item()
 
       # Fill cache
       it.update(1)
