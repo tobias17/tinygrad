@@ -206,6 +206,10 @@ class Transformer:
     # return logits.flatten().realize()
     return sampler(logits.flatten(), unif_samples).realize()
 
+  @TinyJit
+  def get_unif_samples(self) -> Tensor:
+    return Tensor.rand(1,1,1).realize()
+
   def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
     if len(self.cache_tokens) == 0:
       self.cache_tokens.append(tokens[0])
@@ -217,25 +221,20 @@ class Transformer:
           self.cache_tokens = self.cache_tokens[:i]
           break
 
+    if not hasattr(self, 'unif_samples'):
+      self.unif_samples = Tensor.rand(1024, 1, 1, 1).realize()
+
     total = len(tokens) - len(self.cache_tokens) + 1
     it: tqdm = tqdm(total=total, disable=(total <= 1))
     while True:
       # Compute next token
       start_pos = len(self.cache_tokens) - 1
+      unif_sample = self.get_unif_samples()
       ten_tok = Tensor([[tokens[start_pos]]], device=device).realize()
-      unif_samples = Tensor.rand(1, 1, 1).realize()
       if start_pos == 0:
-        # logits = self.forward(ten_tok, 0, sampler)
-        gen_tok = self.forward(ten_tok, 0, sampler, unif_samples).item()
+        gen_tok = self.forward(ten_tok, 0, sampler, unif_sample).item()
       else:
-        # logits = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler)
-        gen_tok = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler, unif_samples).item()
-      
-      # # logits = logits.to(Device.DEFAULT).realize()
-      # # logits = (logits != logits).where(-float("inf"), logits).realize()
-      # # t = logits.softmax().realize()
-      # # gen_tok = t.multinomial().item()
-      # gen_tok = logits.argmax().item()
+        gen_tok = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler, unif_sample).item()
 
       # Fill cache
       it.update(1)
