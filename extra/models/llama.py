@@ -1,6 +1,24 @@
-from typing import Union, Optional, Any
+from typing import Tuple, Union, Optional, Dict, Any, List
 from tinygrad import Tensor, Variable, TinyJit, dtypes, nn, Device
-from tinygrad.helpers import getenv
+from tinygrad.helpers import getenv, tqdm
+from dataclasses import dataclass
+
+@dataclass
+class ModelConfig:
+  dim: int
+  hidden_dim: int
+  n_layers: int
+  vocab_size: int
+  max_context: int
+  n_heads: int
+  head_dim: Optional[int] = None
+  n_kv_heads: Optional[int] = None
+  norm_eps: float = 1e-5
+  rope_theta: float = 100000000.0
+  shard_kvcache: Optional[int] = None
+
+  def get_head_dim(self) -> int:
+    return self.head_dim if self.head_dim is not None else self.dim // self.n_heads
 
 # https://github.com/facebookresearch/llama/blob/1076b9c51c77ad06e9d7ba8a4c6df775741732bd/llama/model.py#L47
 def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
@@ -32,17 +50,18 @@ def repeat_kv(x:Tensor, n_rep:int) -> Tensor:
   return x.repeat((1, 1, 1, n_rep)).reshape(bs, seqlen, n_kv_heads * n_rep, head_dim)
 
 class Attention:
-  def __init__(self, dim, n_heads, n_kv_heads, max_context, linear=nn.Linear):
-    self.n_heads = n_heads
-    self.n_kv_heads = n_kv_heads if n_kv_heads is not None else n_heads # n_kv_heads != n_heads implies MQA [arxiv/2307.09288, A.2.1]
-    self.head_dim = dim // n_heads
+  def __init__(self, cfg:ModelConfig, linear=nn.Linear):
+    self.n_heads = cfg.n_heads
+    self.n_kv_heads = cfg.n_kv_heads if cfg.n_kv_heads is not None else cfg.n_heads # n_kv_heads != n_heads implies MQA [arxiv/2307.09288, A.2.1]
+    self.head_dim = cfg.get_head_dim()
     self.n_rep = self.n_heads // self.n_kv_heads
-    self.max_context = max_context
+    self.max_context = cfg.max_context
+    self.shard_kvcache = cfg.shard_kvcache
 
-    self.wq = linear(dim, self.n_heads * self.head_dim, bias=False)
-    self.wk = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-    self.wv = linear(dim, self.n_kv_heads * self.head_dim, bias=False)
-    self.wo = linear(self.n_heads * self.head_dim, dim, bias=False)
+    self.wq = linear(cfg.dim, self.n_heads * self.head_dim, bias=False)
+    self.wk = linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wv = linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
+    self.wo = linear(self.n_heads * self.head_dim, cfg.dim, bias=False)
 
   def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Optional[Tensor]) -> Tensor:
     if getenv("WQKV"):
@@ -52,7 +71,7 @@ class Attention:
     else:
       xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
 
-    xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads, self.head_dim)
+    xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads,    self.head_dim)
     xk = xk.reshape(xk.shape[0], xk.shape[1], self.n_kv_heads, self.head_dim)
     xv = xv.reshape(xv.shape[0], xv.shape[1], self.n_kv_heads, self.head_dim)
 
@@ -64,13 +83,14 @@ class Attention:
       self.cache_kv = Tensor.zeros(2, bsz, self.max_context, self.n_kv_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
       if isinstance(x.device, tuple):
         # TODO: instead of specifying how to shard, it can follow how xk and xv are being sharded
-        self.cache_kv.shard_((x.device), axis=3 if getenv("SHARD_KVCACHE") else None).realize()
+        self.cache_kv.shard_((x.device), axis=self.shard_kvcache).realize()
 
     # update the cache
     assert xk.dtype == xv.dtype == self.cache_kv.dtype, f"{xk.dtype=}, {xv.dtype=}, {self.cache_kv.dtype=}"
+    # assign = Tensor.stack(xk, xv).to(Device.DEFAULT).shard(self.cache_kv.device, axis=None)
     self.cache_kv.shrink((None, None, (start_pos, start_pos+seqlen), None, None)).assign(Tensor.stack(xk, xv)).realize()
 
-    keys = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xk
+    keys   = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xk
     values = self.cache_kv[1].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xv
 
     keys, values = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
@@ -89,78 +109,90 @@ class FeedForward:
     return self.w2(self.w1(x).silu() * self.w3(x)) # SwiGLU [arxiv/2002.05202, eq (5)]
 
 class TransformerBlock:
-  def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_kv_heads:int, norm_eps:float, max_context:int, linear=nn.Linear, feed_forward=FeedForward):
-    self.attention = Attention(dim, n_heads, n_kv_heads, max_context, linear)
-    self.feed_forward = feed_forward(dim, hidden_dim, linear)
-    self.attention_norm = nn.RMSNorm(dim, norm_eps)
-    self.ffn_norm = nn.RMSNorm(dim, norm_eps)
+  def __init__(self, cfg:ModelConfig, linear=nn.Linear, feed_forward=FeedForward):
+    self.attention = Attention(cfg, linear)
+    self.feed_forward = feed_forward(cfg.dim, cfg.hidden_dim, linear)
+    self.attention_norm = nn.RMSNorm(cfg.dim, cfg.norm_eps)
+    self.ffn_norm = nn.RMSNorm(cfg.dim, cfg.norm_eps)
 
   def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Optional[Tensor]):
     h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
     return (h + self.feed_forward(self.ffn_norm(h))).contiguous()
 
-# standard openai sampling
-def sample(logits: Tensor, temp: float, k: int, p: float, af: float, ap: float):
-  assert logits.ndim == 1, "only works on 1d tensors"
-  assert 0 <= p <= 1, "p must be between 0 and 1"
-  assert 0 <= k <= logits.numel(), "k must be between 0 and numel"
+class TokenSampler:
+  alpha_counter: Optional[Tensor] = None
+  def __init__(self, temperature:float, top_k:int, top_p:float, alpha_f:float, alpha_p:float):
+    self.temp = temperature
+    self.k = top_k
+    self.p = top_p
+    self.af = alpha_f
+    self.ap = alpha_p
 
-  # if temperature is very low just use argmax
-  if temp < 1e-6: return logits.argmax()
+  # standard openai sampling
+  def __call__(self, logits:Tensor, unif_samples:Tensor) -> Tensor:
+    assert logits.ndim == 1, "only works on 1d tensors"
+    assert 0 <= self.p <= 1, "p must be between 0 and 1"
+    assert 0 <= self.k <= logits.numel(), "k must be between 0 and numel"
 
-  logits = logits.to(Device.DEFAULT)
+    # if temperature is very low just use argmax
+    if self.temp < 1e-6: return logits.argmax()
 
-  # alpha sampling
-  if af or ap:
-    if not hasattr(sample, "alpha_counter"):
-      setattr(sample, "alpha_counter", Tensor.zeros_like(logits, dtype=dtypes.int32).contiguous())
-    logits = logits - (sample.alpha_counter * af + (sample.alpha_counter > 0) * ap)
+    logits = logits.to(Device.DEFAULT)
 
-  # replace NaNs with -inf
-  logits = (logits != logits).where(-float("inf"), logits)
+    # alpha sampling
+    if self.af or self.ap:
+      if self.alpha_counter is None:
+        self.alpha_counter = Tensor.zeros_like(logits, dtype=dtypes.int32).contiguous()
+      logits = logits - (self.alpha_counter * self.af + (self.alpha_counter > 0) * self.ap)
 
-  # softmax
-  t = (logits / temp).softmax()
+    # replace NaNs with -inf
+    logits = (logits != logits).where(-float("inf"), logits)
 
-  counter, counter2 = Tensor.arange(t.numel(), device=logits.device).contiguous(), Tensor.arange(t.numel() - 1, -1, -1, device=logits.device).contiguous()
-  # top k
-  if k:
-    output, output_indices = Tensor.zeros(k, device=logits.device).contiguous(), Tensor.zeros(k, device=logits.device, dtype=dtypes.int32).contiguous()
-    for i in range(k):
-      t_argmax = (t.numel() - ((t == (t_max := t.max())) * counter2).max() - 1).cast(dtypes.default_int)
-      output = output + t_max.unsqueeze(0).pad(((i, k - i - 1),))
-      output_indices = output_indices + t_argmax.unsqueeze(0).pad(((i, k - i - 1),))
-      t = (counter == t_argmax).where(0, t)
+    # softmax
+    t = (logits / self.temp).softmax()
 
-    # approximate top p
-    # because we are already limited to top k elements we can do top p "without sorting"
-    output_cumsum = output[::-1].cumsum()[::-1] + t.sum()
-    output = (output_cumsum >= (1 - p)) * output
-    output_indices = (output_cumsum >= (1 - p)) * output_indices
+    counter, counter2 = Tensor.arange(t.numel(), device=logits.device).contiguous(), Tensor.arange(t.numel() - 1, -1, -1, device=logits.device).contiguous()
+    # top k
+    if self.k:
+      output, output_indices = Tensor.zeros(self.k, device=logits.device).contiguous(), Tensor.zeros(self.k, device=logits.device, dtype=dtypes.int32).contiguous()
+      for i in range(self.k):
+        t_argmax = (t.numel() - ((t == (t_max := t.max())) * counter2).max() - 1).cast(dtypes.default_int)
+        output = output + t_max.unsqueeze(0).pad(((i, self.k - i - 1),))
+        output_indices = output_indices + t_argmax.unsqueeze(0).pad(((i, self.k - i - 1),))
+        t = (counter == t_argmax).where(0, t)
 
-    # sample
-    output_idx = output.multinomial()
-    output_token = output_indices[output_idx]
-  else:
-    output_token = t.multinomial()
+      # approximate top p
+      # because we are already limited to top k elements we can do top p "without sorting"
+      output_cumsum = output[::-1].cumsum()[::-1] + t.sum()
+      output = (output_cumsum >= (1 - self.p)) * output
+      output_indices = (output_cumsum >= (1 - self.p)) * output_indices
 
-  # increase alpha counter
-  if af or ap:
-    sample.alpha_counter = (counter == output_token).where(sample.alpha_counter + 1, sample.alpha_counter)
+      # sample
+      output_idx = output.multinomial(unif_samples=unif_samples)
+      output_token = output_indices[output_idx]
+    else:
+      output_token = t.multinomial(unif_samples=unif_samples)
 
-  return output_token
+    # increase alpha counter
+    if self.af or self.ap:
+      assert self.alpha_counter is not None
+      self.alpha_counter = (counter == output_token).where(self.alpha_counter + 1, self.alpha_counter)
+
+    return output_token
 
 class Transformer:
-  def __init__(self, dim:int, hidden_dim:int, n_heads:int, n_layers:int, norm_eps:float, vocab_size, linear=nn.Linear, n_kv_heads=None, rope_theta=10000, max_context=1024, jit=True, feed_forward=FeedForward):
-    self.layers = [TransformerBlock(dim, hidden_dim, n_heads, n_kv_heads, norm_eps, max_context, linear, feed_forward=feed_forward) for _ in range(n_layers)]
-    self.norm = nn.RMSNorm(dim, norm_eps)
-    self.tok_embeddings = nn.Embedding(vocab_size, dim)
-    self.output = nn.Linear(dim, vocab_size, bias=False)
-    self.max_context = max_context
-    self.freqs_cis = precompute_freqs_cis(dim // n_heads, self.max_context * 2, rope_theta).contiguous()
-    self.forward_jit = TinyJit(self.forward) if jit else None
+  def __init__(self, cfg:ModelConfig, linear=nn.Linear, feed_forward=FeedForward):
+    self.layers = [TransformerBlock(cfg, linear, feed_forward=feed_forward) for _ in range(cfg.n_layers)]
+    self.norm = nn.RMSNorm(cfg.dim, cfg.norm_eps)
+    self.tok_embeddings = nn.Embedding(cfg.vocab_size, cfg.dim)
+    self.output = nn.Linear(cfg.dim, cfg.vocab_size, bias=False)
+    self.max_context = cfg.max_context
+    self.freqs_cis = precompute_freqs_cis(cfg.get_head_dim(), self.max_context * 2, cfg.rope_theta).contiguous()
+    self.forward_jit = TinyJit(self.forward)
 
-  def forward(self, tokens:Tensor, start_pos:Union[Variable,int], temperature:float, top_k:int, top_p:float, alpha_f:float, alpha_p:float):
+    self.cache_tokens: List[int] = []
+
+  def forward(self, tokens:Tensor, start_pos:Union[Variable,int], sampler:TokenSampler, unif_samples:Tensor) -> Tensor:
     _bsz, seqlen = tokens.shape
     h = self.tok_embeddings(tokens)
 
@@ -171,13 +203,47 @@ class Transformer:
     for layer in self.layers: h = layer(h, start_pos, freqs_cis, mask)
     logits = self.output(self.norm(h)).float()[:, -1, :]
 
-    return sample(logits.flatten(), temperature, top_k, top_p, alpha_f, alpha_p).realize()
+    # return logits.flatten().realize()
+    return sampler(logits.flatten(), unif_samples).realize()
 
-  def __call__(self, tokens:Tensor, start_pos:int, temperature:float=0.0, top_k:int=0, top_p:float=0.8, alpha_f:float=0.0, alpha_p:float=0.0):
-    # TODO: better way to handle the first call v.s. the rest?
-    if tokens.shape[0:2] == (1,1) and self.forward_jit is not None and start_pos != 0:
-      return self.forward_jit(tokens, Variable("start_pos", 1, self.max_context).bind(start_pos), temperature, top_k, top_p, alpha_f, alpha_p)
-    return self.forward(tokens, start_pos, temperature, top_k, top_p, alpha_f, alpha_p)
+  @TinyJit
+  def get_unif_samples(self) -> Tensor:
+    return Tensor.rand(1,1,1).realize()
+
+  def __call__(self, tokens:List[int], device:Union[str,Tuple[str,...]], sampler:TokenSampler) -> int:
+    if len(self.cache_tokens) == 0:
+      self.cache_tokens.append(tokens[0])
+    else:
+      if len(tokens) < len(self.cache_tokens):
+        self.cache_tokens = self.cache_tokens[:len(tokens)]
+      for i, (inp,cache) in enumerate(zip(tokens,self.cache_tokens)):
+        if inp != cache:
+          self.cache_tokens = self.cache_tokens[:i]
+          break
+
+    if not hasattr(self, 'unif_samples'):
+      self.unif_samples = Tensor.rand(1024, 1, 1, 1).realize()
+
+    total = len(tokens) - len(self.cache_tokens) + 1
+    it: tqdm = tqdm(total=total, disable=(total <= 1))
+    while True:
+      # Compute next token
+      start_pos = len(self.cache_tokens) - 1
+      unif_sample = self.get_unif_samples()
+      ten_tok = Tensor([[tokens[start_pos]]], device=device).realize()
+      if start_pos == 0:
+        gen_tok = self.forward(ten_tok, 0, sampler, unif_sample).item()
+      else:
+        gen_tok = self.forward_jit(ten_tok, Variable("start_pos", 1, self.max_context).bind(start_pos), sampler, unif_sample).item()
+
+      # Fill cache
+      it.update(1)
+      if start_pos + 1 < len(tokens):
+        self.cache_tokens.append(tokens[start_pos + 1])
+      else:
+        assert isinstance(gen_tok, int)
+        self.cache_tokens.append(gen_tok) # type: ignore
+        return gen_tok
 
 # *** helpers ***
 
