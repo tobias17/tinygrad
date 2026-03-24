@@ -6,8 +6,11 @@
 ::: tinygrad.Tensor.min
 ::: tinygrad.Tensor.any
 ::: tinygrad.Tensor.all
+::: tinygrad.Tensor.isclose
+::: tinygrad.Tensor.allclose
 ::: tinygrad.Tensor.mean
 ::: tinygrad.Tensor.var
+::: tinygrad.Tensor.var_mean
 ::: tinygrad.Tensor.std
 ::: tinygrad.Tensor.std_mean
 ::: tinygrad.Tensor.softmax
@@ -21,18 +24,28 @@
 
 ::: tinygrad.Tensor.avg_pool2d
 ::: tinygrad.Tensor.max_pool2d
+::: tinygrad.Tensor.max_unpool2d
 ::: tinygrad.Tensor.conv2d
 ::: tinygrad.Tensor.conv_transpose2d
 ::: tinygrad.Tensor.dot
 ::: tinygrad.Tensor.matmul
 ::: tinygrad.Tensor.einsum
 ::: tinygrad.Tensor.cumsum
+::: tinygrad.Tensor.cumprod
 ::: tinygrad.Tensor.cummax
+::: tinygrad.Tensor.cummin
 ::: tinygrad.Tensor.triu
 ::: tinygrad.Tensor.tril
 ::: tinygrad.Tensor.interpolate
 ::: tinygrad.Tensor.scatter
 ::: tinygrad.Tensor.scatter_reduce
+::: tinygrad.Tensor.masked_select
+::: tinygrad.Tensor.masked_fill
+::: tinygrad.Tensor.nonzero
+::: tinygrad.Tensor.sort
+::: tinygrad.Tensor.argsort
+::: tinygrad.Tensor.topk
+::: tinygrad.Tensor.multinomial
 
 ## Neural Network (functional)
 
@@ -48,3 +61,8 @@
 ::: tinygrad.Tensor.sparse_categorical_crossentropy
 ::: tinygrad.Tensor.cross_entropy
 ::: tinygrad.Tensor.nll_loss
+
+## Linear Algebra
+
+::: tinygrad.Tensor.qr
+::: tinygrad.Tensor.svd

@@ -2,16 +2,14 @@ from __future__ import annotations
 from typing import Any
 import ctypes, time
 from tinygrad.runtime.autogen import cuda as orig_cuda
+from test.mockgpu.helpers import _try_dlopen_gpuocelot
 from tinygrad.helpers import mv_address
 
 for attr in dir(orig_cuda):
   if not attr.startswith('__'):
     globals()[attr] = getattr(orig_cuda, attr)
 
-try:
-  gpuocelot_lib = ctypes.CDLL(ctypes.util.find_library("gpuocelot"))
-  gpuocelot_lib.ptx_run.argtypes = [ctypes.c_char_p, ctypes.c_int, ctypes.POINTER(ctypes.c_void_p), ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int]  # noqa: E501
-except Exception: pass
+gpuocelot_lib = _try_dlopen_gpuocelot()
 
 # Global state
 class CUDAState:
@@ -72,11 +70,11 @@ def cuMemFree_v2(dptr) -> int:
   return orig_cuda.CUDA_ERROR_INVALID_VALUE
 
 def cuMemcpyHtoDAsync_v2(dst, src: ctypes.c_void_p, bytesize: int, stream: Any) -> int:
-  ctypes.memmove(dst.value, src, bytesize)
+  ctypes.memmove(dst if isinstance(dst, int) else dst.value, src, bytesize)
   return orig_cuda.CUDA_SUCCESS
 
 def cuMemcpyDtoH_v2(dst: ctypes.c_void_p, src, bytesize: int) -> int:
-  ctypes.memmove(dst, src.value, bytesize)
+  ctypes.memmove(dst, src if isinstance(src, int) else src.value, bytesize)
   return orig_cuda.CUDA_SUCCESS
 
 def cuEventCreate(phEvent, flags: int) -> int:
@@ -100,7 +98,7 @@ def cuEventSynchronize(hEvent) -> int:
 def cuEventElapsedTime(pMilliseconds, hStart, hEnd) -> int:
   if hStart.value not in cuda_state.events or hEnd.value not in cuda_state.events:
     return orig_cuda.CUDA_ERROR_INVALID_VALUE
-  elapsed = (cuda_state.events[hEnd.value] - cuda_state.events[hStart.value]) * 1000
+  elapsed = (cuda_state.events[hEnd.value] - cuda_state.events[hStart.value]) * 1e-6
   pMilliseconds._obj.value = elapsed
   return orig_cuda.CUDA_SUCCESS
 
@@ -129,8 +127,11 @@ def cuModuleUnload(hmod) -> int:
 
 def cuLaunchKernel(f, gx: int, gy: int, gz: int, lx: int, ly: int, lz: int, sharedMemBytes: int,
                    hStream: Any, kernelParams: Any, extra: Any) -> int:
-  cargs = [ctypes.cast(getattr(extra, field[0]), ctypes.c_void_p) for field in extra._fields_]
-  gpuocelot_lib.ptx_run(ctypes.cast(f.value, ctypes.c_char_p), len(cargs), (ctypes.c_void_p*len(cargs))(*cargs), lx, ly, lz, gx, gy, gz, 0)
+  cargs = [ctypes.cast(getattr(extra, field[0]), ctypes.c_void_p) for field in extra._real_fields_]
+  try: gpuocelot_lib.ptx_run(ctypes.cast(f.value, ctypes.c_char_p), len(cargs), (ctypes.c_void_p*len(cargs))(*cargs), lx, ly, lz, gx, gy, gz, 0)
+  except Exception as e:
+    print("Error in cuLaunchKernel:", e)
+    return orig_cuda.CUDA_ERROR_LAUNCH_FAILED
   return orig_cuda.CUDA_SUCCESS
 
 def cuDeviceComputeCapability(major, minor, dev: int) -> int:
@@ -153,7 +154,7 @@ def cuMemHostAlloc(pp, bytesize: int, flags: int) -> int:
 def cuMemFreeHost(p: ctypes.c_void_p) -> int: return cuMemFree_v2(p)
 
 def cuMemcpyDtoDAsync_v2(dst, src, bytesize: int, stream: Any) -> int:
-  ctypes.memmove(dst.value, src.value, bytesize)
+  ctypes.memmove(dst if isinstance(dst, int) else dst.value, src if isinstance(src, int) else src.value, bytesize)
   return orig_cuda.CUDA_SUCCESS
 
 def cuFuncSetAttribute(hfunc, attrib: int, value: int) -> int:
@@ -163,7 +164,7 @@ def cuStreamWaitEvent(stream: Any, event, flags: int) -> int: return orig_cuda.C
 def cuCtxSynchronize() -> int: return orig_cuda.CUDA_SUCCESS
 
 def cuGetErrorString(error: int, pStr) -> int:
-  error_str = orig_cuda.cudaError_enum__enumvalues.get(error, "Unknown CUDA error").encode()
+  error_str = orig_cuda.enum_cudaError_enum.get(error, "Unknown CUDA error").encode()
   buf = ctypes.create_string_buffer(error_str)
   # Set the pointer to point to our error string buffer
   pStr._obj.value = ctypes.cast(buf, ctypes.POINTER(ctypes.c_char))

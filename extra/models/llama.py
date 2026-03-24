@@ -1,6 +1,7 @@
-from typing import Tuple, Union, Optional, Dict, Any, List
+from typing import Union, Optional, Any, List, Tuple
+import collections, math
 from tinygrad import Tensor, Variable, TinyJit, dtypes, nn, Device
-from tinygrad.helpers import getenv, tqdm
+from tinygrad.helpers import getenv, DEBUG
 from dataclasses import dataclass
 
 @dataclass
@@ -16,6 +17,7 @@ class ModelConfig:
   norm_eps: float = 1e-5
   rope_theta: float = 100000000.0
   shard_kvcache: Optional[int] = None
+  qk_norm = None
 
   def get_head_dim(self) -> int:
     return self.head_dim if self.head_dim is not None else self.dim // self.n_heads
@@ -26,6 +28,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0) -> Tensor:
   freqs = Tensor.arange(end).unsqueeze(dim=1) * freqs.unsqueeze(dim=0)
   return Tensor.stack(freqs.cos(), freqs.sin(), dim=-1).reshape(1, end, 1, dim//2, 2)
 
+# matches meta, non hugging face weights
 # (a+i*b) * (c+i*d) = (ac-bd) + i*(ad+bc)
 def complex_mult(A, c, d):
   a,b = A[..., 0:1], A[..., 1:2]
@@ -63,13 +66,25 @@ class Attention:
     self.wv = linear(cfg.dim, self.n_kv_heads * self.head_dim, bias=False)
     self.wo = linear(self.n_heads * self.head_dim, cfg.dim, bias=False)
 
-  def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Optional[Tensor]) -> Tensor:
+    self.q_norm = nn.RMSNorm(cfg.dim, cfg.qk_norm) if cfg.qk_norm is not None else None
+    self.k_norm = nn.RMSNorm(cfg.dim, cfg.qk_norm) if cfg.qk_norm is not None else None
+
+  def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Optional[Tensor]=None) -> Tensor:
     if getenv("WQKV"):
-      if not hasattr(self, 'wqkv'): self.wqkv = Tensor.cat(self.wq.weight, self.wk.weight, self.wv.weight)
-      xqkv = x @ self.wqkv.T
-      xq, xk, xv = xqkv.split([self.wq.weight.shape[0], self.wk.weight.shape[0], self.wv.weight.shape[0]], dim=2)
+      xqkv = self.wqkv(x)
+      xqkv = xqkv.reshape(xqkv.shape[0], xqkv.shape[1], self.n_kv_heads, self.n_rep + 2, self.head_dim)
+      xq = xqkv[:, :, :, :self.n_rep].reshape(xqkv.shape[0], xqkv.shape[1], -1)
+      xk = xqkv[:, :, :, self.n_rep:self.n_rep+1].reshape(xqkv.shape[0], xqkv.shape[1], -1)
+      xv = xqkv[:, :, :, self.n_rep+1:self.n_rep+2].reshape(xqkv.shape[0], xqkv.shape[1], -1)
     else:
-      xq, xk, xv = self.wq(x), self.wk(x), self.wv(x)
+      xq, xk, xv = self.wq(x), self.wk(x.contiguous_backward()), self.wv(x)
+
+    if self.q_norm is not None and self.k_norm is not None:
+      xq = self.q_norm(xq)
+      xk = self.k_norm(xk)
+
+    # cast_float_to_bf16 is expensive in reduction loops, break it out
+    if x.dtype == dtypes.bfloat16: xq, xk = xq.contiguous_backward(), xk.contiguous_backward()
 
     xq = xq.reshape(xq.shape[0], xq.shape[1], self.n_heads,    self.head_dim)
     xk = xk.reshape(xk.shape[0], xk.shape[1], self.n_kv_heads, self.head_dim)
@@ -93,9 +108,26 @@ class Attention:
     keys   = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xk
     values = self.cache_kv[1].shrink((None, (0, start_pos+seqlen), None, None)) if start_pos > 0 else xv
 
-    keys, values = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
-    xq, keys, values = xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
-    attn = xq.scaled_dot_product_attention(keys, values, mask).transpose(1, 2)
+    if self.max_context:
+      keys, values = repeat_kv(keys, self.n_rep), repeat_kv(values, self.n_rep)
+      xq, keys, values = xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
+      attn = xq.scaled_dot_product_attention(keys, values, mask).transpose(1, 2)
+    else:
+      xq, keys, values = xq.transpose(1, 2), keys.transpose(1, 2), values.transpose(1, 2)
+      attn = xq.scaled_dot_product_attention(keys, values, is_causal=True, enable_gqa=True).transpose(1, 2)
+    if getenv("STUB_ATTENTION"):
+      from tinygrad.uop.ops import UOp, KernelInfo
+      def fa_custom_forward(attn:UOp, q:UOp, k:UOp, v:UOp) -> UOp:
+        return UOp.sink(arg=KernelInfo(name="fa_custom_forward"))
+      def fa_custom_backward(out_q:UOp, out_k:UOp, out_v:UOp, grad:UOp, q:UOp, k:UOp, v:UOp) -> UOp:
+        return UOp.sink(arg=KernelInfo(name="fa_custom_backward"))
+      def fa_backward(grad:UOp, kernel:UOp) -> tuple[None, UOp, UOp, UOp]:
+        grad_q = Tensor.empty_like(q:=Tensor(kernel.src[2]))
+        grad_k = Tensor.empty_like(k:=Tensor(kernel.src[3]))
+        grad_v = Tensor.empty_like(v:=Tensor(kernel.src[4]))
+        ck = Tensor.custom_kernel(grad_q, grad_k, grad_v, Tensor(grad), q, k, v, fxn=fa_custom_backward)[:3]
+        return (None, ck[0].uop, ck[1].uop, ck[2].uop)
+      attn = Tensor.empty_like(attn).custom_kernel(xq, keys, values, fxn=fa_custom_forward, grad_fxn=fa_backward)[0]
     attn = attn.reshape(bsz, seqlen, -1)
     return self.wo(attn)
 
@@ -106,7 +138,9 @@ class FeedForward:
     self.w3 = linear(dim, hidden_dim, bias=False) # the gate in Gated Linear Unit
 
   def __call__(self, x:Tensor) -> Tensor:
-    return self.w2(self.w1(x).silu() * self.w3(x)) # SwiGLU [arxiv/2002.05202, eq (5)]
+    w1 = self.w1(x).silu()
+    w3 = self.w3(x.contiguous_backward())  # this fixes a strange fusion that makes tensor cores miss
+    return self.w2(w1 * w3)
 
 class TransformerBlock:
   def __init__(self, cfg:ModelConfig, linear=nn.Linear, feed_forward=FeedForward):
@@ -117,7 +151,7 @@ class TransformerBlock:
 
   def __call__(self, x:Tensor, start_pos:Union[Variable,int], freqs_cis:Tensor, mask:Optional[Tensor]):
     h = x + self.attention(self.attention_norm(x), start_pos, freqs_cis, mask)
-    return (h + self.feed_forward(self.ffn_norm(h))).contiguous()
+    return (h + self.feed_forward(self.ffn_norm(h))).contiguous().contiguous_backward()
 
 class TokenSampler:
   alpha_counter: Optional[Tensor] = None
@@ -194,16 +228,15 @@ class Transformer:
 
   def forward(self, tokens:Tensor, start_pos:Union[Variable,int], sampler:TokenSampler, unif_samples:Tensor) -> Tensor:
     _bsz, seqlen = tokens.shape
-    h = self.tok_embeddings(tokens)
+    h = self.tok_embeddings(tokens).contiguous()
+    freqs_cis = self.freqs_cis.cast(h.dtype)[:, start_pos:start_pos+seqlen, :, :, :]
 
-    self.freqs_cis = self.freqs_cis.cast(h.dtype).realize()
-    freqs_cis = self.freqs_cis.shrink((None, (start_pos, start_pos+seqlen),None,None,None))
-
-    mask = Tensor.full((1, 1, seqlen, start_pos+seqlen), float("-inf"), dtype=h.dtype, device=h.device).triu(start_pos+1).realize() if seqlen > 1 else None
+    if self.max_context != 0 and seqlen > 1:
+      mask = Tensor.full((1, 1, seqlen, start_pos+seqlen), float("-inf"), dtype=h.dtype, device=h.device).triu(start_pos+1)
+    else: mask = None
     for layer in self.layers: h = layer(h, start_pos, freqs_cis, mask)
-    logits = self.output(self.norm(h)).float()[:, -1, :]
+    logits = self.output(self.norm(h).contiguous().contiguous_backward()).contiguous_backward()
 
-    # return logits.flatten().realize()
     return sampler(logits.flatten(), unif_samples).realize()
 
   @TinyJit
@@ -247,40 +280,54 @@ class Transformer:
 
 # *** helpers ***
 
-def convert_from_huggingface(weights:dict[str, Tensor], model: Transformer, n_heads: int, n_kv_heads: int, permute_layers: bool = True):
+# TODO: n_kv_heads should support None
+def convert_from_huggingface(weights:dict[str, Tensor], n_layers: int, n_heads: int, n_kv_heads: int, permute_layers: bool = True):
+  # huggingface stores Q and K permuted! it is mostly correct without this, but without it makes RoPE different, so it will diverge after 10+ toks.
   def permute(v: Tensor, n_heads: int):
-    return v.reshape(n_heads, 2, v.shape[0] // n_heads // 2, v.shape[1]).transpose(1, 2).reshape(*v.shape[:2])
+    return v.reshape(n_heads, 2, v.shape[0] // n_heads // 2, v.shape[1] if len(v.shape) > 1 else 1).transpose(1, 2).reshape(*v.shape[:2])
 
   keymap = {
     "model.embed_tokens.weight": "tok_embeddings.weight",
-    **{f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.self_attn.{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "o"] for l in range(len(model.layers))},
-    **{f"model.layers.{l}.self_attn.{x}_proj.bias": f"layers.{l}.attention.w{x}.bias" for x in ["q", "k", "v", "o"] for l in range(len(model.layers))},
-    **{f"model.layers.{l}.post_attention_layernorm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
-    **{f"model.layers.{l}.mlp.{x}_proj.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(len(model.layers))},
+    **{f"model.layers.{l}.input_layernorm.weight": f"layers.{l}.attention_norm.weight" for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_norm.weight": f"layers.{l}.attention.{x}_norm.weight" for x in ["q", "k"] for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_proj.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+    **{f"model.layers.{l}.self_attn.{x}_proj.bias": f"layers.{l}.attention.w{x}.bias" for x in ["q", "k", "v", "o"] for l in range(n_layers)},
+    **{f"model.layers.{l}.post_attention_layernorm.weight": f"layers.{l}.ffn_norm.weight" for l in range(n_layers)},
+    **{f"model.layers.{l}.mlp.{x}_proj.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
+    **{f"model.layers.{l}.mlp.gate.weight": f"layers.{l}.feed_forward.gate.weight" for l in range(n_layers)},
     "model.norm.weight": "norm.weight",
     "lm_head.weight": "output.weight",
   }
   sd = {}
+  experts = collections.defaultdict(dict)
   for k, v in weights.items():
     if ".rotary_emb." in k: continue
     v = v.to(Device.DEFAULT)
     if "model.layers" in k:
-      if "q_proj" in k and permute_layers:
-        v = permute(v, n_heads)
-      elif "k_proj" in k and permute_layers:
-        v = permute(v, n_kv_heads)
+      if ("q_proj" in k or "q_norm" in k) and permute_layers: v = permute(v, n_heads)
+      elif ("k_proj" in k or "k_norm" in k) and permute_layers: v = permute(v, n_kv_heads)
+    if '.mlp.experts.' in k:
+      # support MoE models
+      _, _, layer, _, _, expert, name, _ = k.split('.')
+      experts[f'layers.{layer}.feed_forward.{name}'][int(expert)] = v
+      continue
     sd[keymap[k]] = v
+  for k,v in experts.items(): sd[k] = Tensor.stack(*[v[i] for i in range(len(v))])
+
+  # Handle tied embeddings (e.g., Llama 3.2 1B Instruct where lm_head shares weights with embed_tokens)
+  if "output.weight" not in sd and "tok_embeddings.weight" in sd:
+    sd["output.weight"] = sd["tok_embeddings.weight"]
+
   return sd
 
-def convert_from_gguf(weights:dict[str, Tensor], model: Transformer):
+def convert_from_gguf(weights:dict[str, Tensor], n_layers:int):
   keymap = {
     "token_embd.weight": "tok_embeddings.weight",
-    **{f"blk.{l}.attn_norm.weight": f"layers.{l}.attention_norm.weight" for l in range(len(model.layers))},
-    **{f"blk.{l}.attn_{x}.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v"] for l in range(len(model.layers))},
-    **{f"blk.{l}.attn_output.weight": f"layers.{l}.attention.wo.weight" for l in range(len(model.layers))},
-    **{f"blk.{l}.ffn_norm.weight": f"layers.{l}.ffn_norm.weight" for l in range(len(model.layers))},
-    **{f"blk.{l}.ffn_{x}.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(len(model.layers))},
+    **{f"blk.{l}.attn_norm.weight": f"layers.{l}.attention_norm.weight" for l in range(n_layers)},
+    **{f"blk.{l}.attn_{x}.weight": f"layers.{l}.attention.w{x}.weight" for x in ["q", "k", "v"] for l in range(n_layers)},
+    **{f"blk.{l}.attn_output.weight": f"layers.{l}.attention.wo.weight" for l in range(n_layers)},
+    **{f"blk.{l}.ffn_norm.weight": f"layers.{l}.ffn_norm.weight" for l in range(n_layers)},
+    **{f"blk.{l}.ffn_{x}.weight": f"layers.{l}.feed_forward.w{y}.weight" for x, y in {"gate": "1", "down": "2", "up": "3"}.items() for l in range(n_layers)},
     "output_norm.weight": "norm.weight",
     "rope_freqs.weight": "rope_freqs.weight",
   }
@@ -289,8 +336,5 @@ def convert_from_gguf(weights:dict[str, Tensor], model: Transformer):
   return sd
 
 def fix_bf16(weights:dict[Any, Tensor]):
-  if getenv("SUPPORT_BF16", 1):
-    # TODO: without casting to float16, 70B llama OOM on tinybox.
-    return {k:v.cast(dtypes.float32).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
-  # TODO: check if device supports bf16
-  return {k:v.llvm_bf16_cast(dtypes.half).to(v.device) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}
+  # TODO: without casting to float16, 70B llama OOM on tinybox.
+  return {k:v.cast(dtypes.float32).cast(dtypes.float16) if v.dtype == dtypes.bfloat16 else v for k,v in weights.items()}

@@ -1,61 +1,7 @@
-from typing import Callable
-import unittest, math
-import jax
-import jax.numpy as jnp
+import unittest
+import numpy as np
 from tinygrad import Tensor
 from tinygrad.dtype import dtypes
-from tinygrad.ops import UOp, Ops
-from tinygrad.gradient import compute_gradient
-
-class TestGradient(unittest.TestCase):
-  def _cmp_nan_okay(self, x, y):
-    if math.isnan(x) and math.isnan(y): return
-    self.assertAlmostEqual(x, y, places=5)
-
-  def _test_one_input_function(self, f:Callable, jf:Callable|None=None):
-    x = UOp.variable('x', -math.inf, math.inf, dtype=dtypes.float)
-    gx = compute_gradient(f(x), UOp.const(dtypes.float, 1.0), set([x]))[x]
-    gf = jax.grad(f if jf is None else jf)
-
-    for val in [-5., -2.0, 0.0, 2.0, 5.]:
-      tg_out, jax_out = gx.substitute({x: x.const_like(val)}).ssimplify(), gf(val).item()
-      self._cmp_nan_okay(tg_out, jax_out)
-
-  def _test_two_input_function(self, f:Callable, jf:Callable|None=None):
-    x = UOp.variable('x', -math.inf, math.inf, dtype=dtypes.float)
-    y = UOp.variable('y', -math.inf, math.inf, dtype=dtypes.float)
-    grads = compute_gradient(f(x, y), UOp.const(dtypes.float, 1.0), set([x, y]))
-    gx, gy = grads[x], grads[y]
-    gf = jax.grad(f if jf is None else jf, argnums=(0, 1))
-
-    for valx in [-5., -2.0, 0.0, 2.0, 5.]:
-      for valy in [-5., -2.0, 0.0, 2.0, 5.]:
-        # Substitute the values into the gradient expressions
-        substitutions = {x: x.const_like(valx), y: y.const_like(valy)}
-        tg_out_x = gx.substitute(substitutions).ssimplify()
-        tg_out_y = gy.substitute(substitutions).ssimplify()
-        jax_out_x, jax_out_y = [x.item() for x in gf(valx, valy)]
-
-        self._cmp_nan_okay(tg_out_x, jax_out_x)
-        self._cmp_nan_okay(tg_out_y, jax_out_y)
-
-  # unary ops unit
-  def test_recip(self): self._test_one_input_function(lambda x: 1.0/x)
-  def test_sin(self): self._test_one_input_function(lambda x: x.sin(), lambda x: jnp.sin(x))
-  def test_sqrt(self): self._test_one_input_function(lambda x: x.sqrt(), lambda x: jnp.sqrt(x))
-  def test_log2(self): self._test_one_input_function(lambda x: x.log2(), lambda x: jnp.log2(x))
-  def test_exp2(self): self._test_one_input_function(lambda x: x.exp2(), lambda x: jnp.exp2(x))
-
-  # binary ops unit
-  def test_add(self): self._test_two_input_function(lambda x,y: x+y)
-  def test_mul(self): self._test_two_input_function(lambda x,y: x*y)
-
-  # chain rule
-  def test_chain(self): self._test_one_input_function(lambda x: x.sin().sqrt(), lambda x: jnp.sqrt(jnp.sin(x)))
-  def test_chain_binop(self): self._test_two_input_function(lambda x,y: (x*y)+x*y)
-  def test_big_add_sin(self): self._test_two_input_function(lambda x,y: x.sin()+3.0/y, lambda x,y: jnp.sin(x)+3.0/y)
-  def test_big_chain(self): self._test_two_input_function(lambda x,y: (1.0/x*y)+x*y)
-  def test_where(self): self._test_two_input_function(lambda x,y: (x<y).where(x,y), lambda x,y: jnp.where(x<y, x, y))
 
 class TestTensorGradient(unittest.TestCase):
   def test_example(self):
@@ -66,10 +12,10 @@ class TestTensorGradient(unittest.TestCase):
     self.assertListEqual(dx.tolist(), [[2.0, 2.0, 2.0], [0.0, 0.0, 0.0], [-2.0, -2.0, -2.0]])
     self.assertListEqual(dy.tolist(), [[1.0, 1.0, 1.0]])
 
-  def test_raises(self):
+  def test_zero_if_not_used(self):
     x = Tensor([1.0, 2.0, 3.0])
     w = Tensor.randn((3,))
-    with self.assertRaises(RuntimeError): x.sum().gradient(w)
+    self.assertListEqual(x.sum().gradient(w)[0].tolist(), [0.0, 0.0, 0.0])
 
   def test_with_custom_gradient(self):
     x = Tensor([1.0, 2.0, 3.0])
@@ -99,25 +45,46 @@ class TestTensorGradient(unittest.TestCase):
     x_casted = x_reshaped.cast(dtypes.float16)
     x_casted.mean().gradient(x_reshaped)
 
-class TestRealizeMeansRealize(unittest.TestCase):
-  def test_randn_realizes(self):
-    x = Tensor.randn(2, 3, 64, 64, requires_grad=True).realize()
-    self.assertEqual(x.lazydata.op, Ops.RESHAPE)
-    assert x.lazydata.is_realized
+  def test_non_float_tensor_raise(self):
+    x = Tensor([1, 2, 3])
+    with self.assertRaises(RuntimeError): x.sum().gradient(x)
+    with self.assertRaises(RuntimeError): x.float().sum().gradient(x)
 
-  #@unittest.expectedFailure
-  # update: passing after delete_forced_realize
-  def test_uniform_realizes(self):
-    x = Tensor.uniform(16, 3, 3, 3, requires_grad=True).realize()
-    print(x.lazydata)
-    self.assertEqual(x.lazydata.op, Ops.RESHAPE)
-    assert x.lazydata.is_realized
+  def test_copy_to_device_gradient(self):
+    t = Tensor([1.0, 2, 3], requires_grad=True).realize()
+    t.to("CPU:1").square().sum().backward()
+    self.assertEqual(t.grad.device, t.device)
+    self.assertListEqual(t.grad.tolist(), [2.0, 4.0, 6.0])
 
-  # NOTE: even though it doesn't realize, this seems fine
-  def test_uniform_gradient(self):
-    x = Tensor.uniform(16, 3, 3, 3, requires_grad=True).realize()
-    y = x * 2
-    y.sum().gradient(x)[0].realize()
+  def test_multiple_backward(self):
+    x = Tensor([3.], requires_grad=True)
+    (x*2)[0].backward()
+    np.testing.assert_allclose(x.grad.numpy(), [2.0])
+    old_grad = x.grad
+    (x*3)[0].backward()
+    np.testing.assert_allclose(x.grad.numpy(), [2.0+3.0])
+    self.assertIs(x.grad, old_grad)
+    (x*x)[0].backward()
+    np.testing.assert_allclose(x.grad.numpy(), [2.0+3.0+2*3.0])
+    self.assertIs(x.grad, old_grad)
+
+  def test_gradient_through_chained_unrealized_setitem(self):
+    g1 = Tensor.zeros(4).contiguous()
+    g1[2] = Tensor(1.0)
+    g2 = Tensor.zeros(5, 4).contiguous()
+    g2[0] = g1
+    x = Tensor.randn(4, 4)
+    np.testing.assert_allclose(x.pad(((1,0),(0,0))).gradient(x, gradient=g2)[0].numpy(), np.zeros((4, 4)))
+
+class TestViewGradient(unittest.TestCase):
+  def test_expand(self):
+    x = Tensor.randn(5,2)
+    a = Tensor([3.], requires_grad=True)
+    aex = a.expand(10)
+    (aex.reshape(5,2) * x).sum().backward()
+    np.testing.assert_allclose(aex.grad.numpy(), x.reshape(10).numpy())
+    with self.assertRaises(AssertionError):
+      np.testing.assert_allclose(aex.grad.numpy(), a.grad.expand(10).numpy())
 
 if __name__ == '__main__':
   unittest.main()

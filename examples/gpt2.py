@@ -3,10 +3,11 @@ import os, argparse, contextlib
 from typing import Optional, Union
 with contextlib.suppress(ImportError): import tiktoken
 from tinygrad import Tensor, TinyJit, Device, GlobalCounters, Variable, dtypes
-from tinygrad.ops import UOp
+from tinygrad.uop.ops import UOp
 from tinygrad.helpers import Timing, DEBUG, JIT, getenv, fetch, colored, trange
 from tinygrad.nn import Embedding, Linear, LayerNorm
 from tinygrad.nn.state import gguf_load, torch_load, load_state_dict, get_state_dict
+from extra.bench_log import BenchEvent, WallTimeEvent
 
 MAX_CONTEXT = getenv("MAX_CONTEXT", 128)
 HALF = getenv("HALF")
@@ -25,8 +26,8 @@ class Attention:
       start_pos = start_pos.val
 
     if HALF: x = x.half()
-    xqkv = self.c_attn(x)
-    xq, xk, xv = [xqkv.shrink((None, None, (i*self.dim, (i+1)*self.dim))).reshape(None, None, self.n_heads, self.head_dim) for i in range(3)]
+    xqkv = self.c_attn(x).reshape(None, None, 3, self.n_heads, self.head_dim)
+    xq, xk, xv = [xqkv[:, :, i, :, :] for i in range(3)]
     bsz, seqlen, _, _ = xq.shape
 
     # create kv cache
@@ -34,11 +35,11 @@ class Attention:
       self.cache_kv = Tensor.zeros(2, bsz, MAX_CONTEXT, self.n_heads, self.head_dim, dtype=x.dtype).contiguous().realize()
 
     # update the cache
-    self.cache_kv.shrink((None, None,(start_pos,start_pos+seqlen),None,None)).assign(Tensor.stack(xk, xv)).realize()
+    self.cache_kv[:, :, start_pos:start_pos+seqlen, :, :].assign(Tensor.stack(xk, xv)).realize()
 
     if start_pos > 0:
-      keys = self.cache_kv[0].shrink((None, (0, start_pos+seqlen), None, None))
-      values = self.cache_kv[1].shrink((None, (0, start_pos+seqlen), None, None))
+      keys = self.cache_kv[0][:, :start_pos+seqlen, :, :]
+      values = self.cache_kv[1][:, :start_pos+seqlen, :, :]
     else:
       keys = xk
       values = xv
@@ -63,7 +64,7 @@ class TransformerBlock:
 
   def __call__(self, x:Tensor, start_pos:Variable, mask:Optional[Tensor]):
     h = x + self.attn(self.ln_1(x), start_pos, mask).float()
-    return (h + self.mlp(self.ln_2(h)))
+    return (h + self.mlp(self.ln_2(h))).contiguous()
 
 class Transformer:
   def __init__(self, dim, n_heads, n_layers, norm_eps, vocab_size, max_seq_len=1024):
@@ -84,7 +85,10 @@ class Transformer:
       seqlen = tokens.shape[1]
       tok_emb = self.wte(tokens)
 
-    pos_emb = self.wpe(self.allpos.shrink((None, (start_pos, start_pos+seqlen))))
+    # not symbolic when consuming the prompt
+    selected_pos = (0, seqlen) if start_pos.val == 0 else (start_pos, start_pos+1)
+    pos_emb = self.wpe(self.allpos.shrink((None, selected_pos)))
+
     h = tok_emb + pos_emb
 
     if HALF: h = h.half()
@@ -134,11 +138,12 @@ class GPT2:
     # lm head and wte are tied
     weights['lm_head.weight'] = weights['wte.weight']
 
-    load_state_dict(model, weights)
+    with WallTimeEvent(BenchEvent.LOAD_WEIGHTS):
+      load_state_dict(model, weights)
 
-    if HALF:
-      for l in get_state_dict(model).values():
-        l.replace(l.half().realize())
+      if HALF:
+        for l in get_state_dict(model).values():
+          l.replace(l.half().realize())
 
     return GPT2(model, tokenizer)
 
@@ -167,7 +172,8 @@ class GPT2:
       return key
     state_dict = { _remap_gguf_key(k): v for k, v in state_dict.items() }
     model = Transformer(**gpt2_params)
-    load_state_dict(model, state_dict)
+    with WallTimeEvent(BenchEvent.LOAD_WEIGHTS):
+      load_state_dict(model, state_dict)
     return GPT2(model, tiktoken.get_encoding("gpt2"))
 
   def __init__(self, model, tokenizer):
@@ -175,6 +181,7 @@ class GPT2:
     self.tokenizer = tokenizer
 
   def generate(self, prompt:str, max_length:int, temperature:float, timing:bool=False, batch_size:int=1):
+    step_times = []
     prompt_tokens = self.tokenizer.encode(prompt, allowed_special={"<|endoftext|>"})
     toks = [prompt_tokens[:] for _ in range(batch_size)]
     start_pos = 0
@@ -182,22 +189,27 @@ class GPT2:
       GlobalCounters.reset()
       if timing: print("")
       st = GlobalCounters.time_sum_s
-      with Timing("ran model in ", on_exit=(lambda et: (f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on GPU" if DEBUG>=2 else "")+
+      with Timing("ran model in ", on_exit=(lambda et: (f", {(GlobalCounters.time_sum_s-st)*1e3:.2f} ms on {Device.DEFAULT}" if DEBUG>=2 else "")+
                   f", {GlobalCounters.global_ops*1e-9:.2f} GOPS, {GlobalCounters.global_mem*1e-9:.2f} GB"+
                   (f", {GlobalCounters.global_mem*1e-9/(GlobalCounters.time_sum_s-st):.2f} GB/s" if DEBUG>=2 else "")) if DEBUG else None, enabled=timing):
-        if batch_size == 1 and len(toks[0][start_pos:]) == 1:
-          tokens = Variable("tokens", 0, VOCAB_SIZE).bind(toks[0][start_pos])
-        else:
-          tokens = Tensor([x[start_pos:] for x in toks])
-        tok = self.model(tokens, Variable("start_pos", 1 if start_pos else 0, MAX_CONTEXT).bind(start_pos), temperature).tolist()
+        with WallTimeEvent(BenchEvent.STEP):
+          if batch_size == 1 and len(toks[0][start_pos:]) == 1:
+            tokens = Variable("tokens", 0, VOCAB_SIZE-1).bind(toks[0][start_pos])
+          else:
+            tokens = Tensor([x[start_pos:] for x in toks])
+          tok = self.model(tokens, Variable("start_pos", 1 if start_pos else 0, MAX_CONTEXT-1).bind(start_pos), temperature).tolist()
+      step_times.append((GlobalCounters.time_sum_s-st)*1e3)
       start_pos = len(toks[0])
       for i,t in enumerate(tok): toks[i].append(t)
+
+    if (assert_time:=getenv("ASSERT_MIN_STEP_TIME")):
+      min_time = min(step_times)
+      assert min_time < assert_time, f"Speed regression, expected min step time of < {assert_time} ms but took: {min_time} ms"
     return [self.tokenizer.decode(x) for x in toks]
 
 # **** main code ****
 
 if __name__ == "__main__":
-  Tensor.no_grad = True
   print(f"using {Device.DEFAULT} backend")
   default_prompt = "What is the answer to life, the universe, and everything?"
 
@@ -220,7 +232,7 @@ if __name__ == "__main__":
   gpt2 = GPT2.build_gguf(args.model_size) if args.model_size.startswith("gpt2_gguf_") else GPT2.build(args.model_size)
 
   if args.benchmark != -1:
-    gpt2.model(Tensor.rand(args.batch_size, args.benchmark), Variable("a", 0, MAX_CONTEXT).bind(0)).realize()
+    gpt2.model(Tensor.randint(args.batch_size, args.benchmark), Variable("a", 0, MAX_CONTEXT).bind(0)).realize()
   else:
     texts = gpt2.generate(args.prompt, args.count, args.temperature, timing=args.timing, batch_size=args.batch_size)
     if not args.noshow:

@@ -6,14 +6,15 @@
 from tinygrad import Tensor, TinyJit, dtypes, GlobalCounters
 from tinygrad.nn import Conv2d, GroupNorm
 from tinygrad.nn.state import safe_load, load_state_dict
-from tinygrad.helpers import fetch, trange, colored, Timing
+from tinygrad.helpers import fetch, trange, colored, Timing, getenv
 from extra.models.clip import Embedder, FrozenClosedClipEmbedder, FrozenOpenClipEmbedder
 from extra.models.unet import UNetModel, Upsample, Downsample, timestep_embedding
+from extra.bench_log import BenchEvent, WallTimeEvent
 from examples.stable_diffusion import ResnetBlock, Mid
 import numpy as np
 
 from typing import Dict, List, Callable, Optional, Any, Set, Tuple, Union, Type
-import argparse, tempfile
+import argparse, tempfile, time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from PIL import Image
@@ -341,23 +342,30 @@ class DPMPP2MSampler:
     sigmas = self.discretization(num_steps).to(x.device)
     x *= Tensor.sqrt(1.0 + sigmas[0] ** 2.0)
     num_sigmas = len(sigmas)
+    step_times = []
 
     old_denoised = None
     for i in trange(num_sigmas - 1):
       with Timing("step in ", enabled=timing, on_exit=lambda _: f", using {GlobalCounters.mem_used/1e9:.2f} GB"):
         GlobalCounters.reset()
-        x, old_denoised = self.sampler_step(
-          old_denoised=old_denoised,
-          prev_sigma=(None if i==0 else sigmas[i-1].expand(x.shape[0])),
-          sigma=sigmas[i].expand(x.shape[0]),
-          next_sigma=sigmas[i+1].expand(x.shape[0]),
-          denoiser=denoiser,
-          x=x,
-          c=c,
-          uc=uc,
-        )
-        x.realize()
-        old_denoised.realize()
+        st = time.perf_counter_ns()
+        with WallTimeEvent(BenchEvent.STEP):
+          x, old_denoised = self.sampler_step(
+            old_denoised=old_denoised,
+            prev_sigma=(None if i==0 else sigmas[i-1].expand(x.shape[0])),
+            sigma=sigmas[i].expand(x.shape[0]),
+            next_sigma=sigmas[i+1].expand(x.shape[0]),
+            denoiser=denoiser,
+            x=x,
+            c=c,
+            uc=uc,
+          )
+          step_times.append(t:=(time.perf_counter_ns() - st)*1e-6)
+          x.realize(old_denoised)
+
+    if (assert_time:=getenv("ASSERT_MIN_STEP_TIME")):
+      min_time = min(step_times)
+      assert min_time < assert_time, f"Speed regression, expected min step time of < {assert_time} ms but took: {min_time} ms"
 
     return x
 
@@ -375,17 +383,24 @@ if __name__ == "__main__":
   parser.add_argument('--weights',  type=str,   help="Custom path to weights")
   parser.add_argument('--timing',   action='store_true', help="Print timing per step")
   parser.add_argument('--noshow',   action='store_true', help="Don't show the image")
+  parser.add_argument('--fakeweights',  action='store_true', help="Load fake weights")
   args = parser.parse_args()
 
-  Tensor.no_grad = True
   if args.seed is not None:
     Tensor.manual_seed(args.seed)
 
   model = SDXL(configs["SDXL_Base"])
 
-  default_weight_url = 'https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors'
-  weights = args.weights if args.weights else fetch(default_weight_url, 'sd_xl_base_1.0.safetensors')
-  load_state_dict(model, safe_load(weights), strict=False)
+  if not args.fakeweights:
+    default_weight_url = 'https://huggingface.co/stabilityai/stable-diffusion-xl-base-1.0/resolve/main/sd_xl_base_1.0.safetensors'
+    weights = args.weights if args.weights else fetch(default_weight_url, 'sd_xl_base_1.0.safetensors')
+    loaded_weights = load_state_dict(model, safe_load(weights), strict=False, verbose=False, realize=False)
+
+    start_mem_used = GlobalCounters.mem_used
+    with Timing("loaded weights in ", lambda et_ns: f", {(B:=(GlobalCounters.mem_used-start_mem_used))/1e9:.2f} GB loaded at {B/et_ns:.2f} GB/s"):
+      with WallTimeEvent(BenchEvent.LOAD_WEIGHTS):
+        Tensor.realize(*loaded_weights)
+      del loaded_weights
 
   N = 1
   C = 4
@@ -396,8 +411,7 @@ if __name__ == "__main__":
 
   c, uc = model.create_conditioning([args.prompt], args.width, args.height)
   del model.conditioner
-  for v in c .values(): v.realize()
-  for v in uc.values(): v.realize()
+  Tensor.realize(*c.values(), *uc.values())
   print("created batch")
 
   # https://github.com/Stability-AI/generative-models/blob/fbdc58cab9f4ee2be7a5e1f2e2787ecd9311942f/sgm/inference/helpers.py#L101
@@ -423,8 +437,8 @@ if __name__ == "__main__":
     im.show()
 
   # validation!
-  if args.prompt == default_prompt and args.steps == 10 and args.seed == 0 and args.guidance == 6.0 and args.width == args.height == 1024 \
-    and not args.weights:
+  is_default = args.prompt == default_prompt and args.steps == 10 and args.seed == 0 and args.guidance == 6.0 and args.width == args.height == 1024
+  if is_default and not args.weights and not args.fakeweights:
     ref_image = Tensor(np.array(Image.open(Path(__file__).parent / "sdxl_seed0.png")))
     distance = (((x.cast(dtypes.float) - ref_image.cast(dtypes.float)) / ref_image.max())**2).mean().item()
     assert distance < 4e-3, colored(f"validation failed with {distance=}", "red")

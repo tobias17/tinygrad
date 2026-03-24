@@ -4,7 +4,9 @@ from tinygrad.device import Buffer, Device
 from tinygrad.helpers import Context, getenv, from_mv
 from tinygrad.dtype import dtypes
 from tinygrad.tensor import Tensor, _to_np_dtype
-from tinygrad.engine.realize import ExecItem, BufferXfer, get_runner
+from tinygrad.engine.realize import BufferXfer, get_runner
+from tinygrad.engine.schedule import ExecItem
+from tinygrad.uop.ops import UOp, Ops
 from tinygrad.engine.jit import apply_graph_to_jit
 
 BUF_LEN = getenv("BUF_LEN", 128)
@@ -16,7 +18,7 @@ def gen_prg(device, inputs_cnt):
   with Context(DEBUG=0):
     fst = [Tensor.randn(BUF_LEN, dtype=dtypes.int).realize() for i in range(inputs_cnt)]
     s = fst[0]
-    for i in range(1, inputs_cnt): s = s.xor(fst[i])
+    for i in range(1, inputs_cnt): s = s.bitwise_xor(fst[i])
 
     si = s.schedule()[-1]
     prg = get_runner(device, si.ast)
@@ -28,20 +30,20 @@ def alloc_rawbuffer(device, fill=False):
   if fill:
     with Context(DEBUG=0):
       data = np.random.randint(-10000, 10000, size=rawbuf.size, dtype=_to_np_dtype(rawbuf.dtype))
-      rawbuf.copyin(Tensor(data).realize().lazydata.base.realized.as_buffer())
+      rawbuf.copyin(Tensor(data).realize().uop.base.realized.as_memoryview())
   return rawbuf
 
 def gen_kernel_ji(device, deps):
   assert len(deps) >= 2
   out = alloc_rawbuffer(device)
   prg = gen_prg(device, len(deps))
-  return ExecItem(prg, [out] + deps)
+  return ExecItem(UOp(Ops.NOOP), [out] + deps, prg=prg)
 
 def gen_copy_ji(device, deps):
   assert len(deps) == 1
   out = alloc_rawbuffer(device)
   prg = BufferXfer(deps[0].nbytes, device, deps[0].device)
-  return ExecItem(prg, [out] + deps)
+  return ExecItem(UOp(Ops.NOOP), [out] + deps, prg=prg)
 
 def gen_graph():
   input_buffers = []
@@ -91,7 +93,7 @@ def run_jit(jis, all_buffers, input_buffers, var_vals):
 
   with Context(DEBUG=0):
     res_buffers = []
-    for rawbuf in all_buffers: res_buffers.append(rawbuf.as_buffer())
+    for rawbuf in all_buffers: res_buffers.append(rawbuf.as_memoryview())
     return res_buffers
 
 def fuzz_graph(jis, all_buffers, input_buffers):
@@ -121,7 +123,7 @@ if __name__ == "__main__":
   np.random.seed(SEED)
 
   next_graph_id = 0
-  while True:
+  for i in range(getenv("ITERS", 1000)):
     print("Running graph", next_graph_id)
     jis, all_buffers, input_buffers = gen_graph()
     fuzz_graph(jis, all_buffers, input_buffers)

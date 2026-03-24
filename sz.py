@@ -4,24 +4,32 @@ import token
 import tokenize
 import itertools
 from tabulate import tabulate
+from tinygrad.uop import Ops
+from tinygrad.helpers import ContextVar
 
 TOKEN_WHITELIST = [token.OP, token.NAME, token.NUMBER, token.STRING]
 
 def is_docstring(t):
   return t.type == token.STRING and t.string.startswith('"""') and t.line.strip().startswith('"""')
 
+def is_js_token(s): return len(s) and not s.startswith('//')
+
 def gen_stats(base_path="."):
   table = []
   for path, _, files in os.walk(os.path.join(base_path, "tinygrad")):
     for name in files:
-      if not name.endswith(".py"): continue
-      if 'tinygrad/runtime/autogen' in path.replace('\\', '/'): continue
+      if not (name.endswith(".py") or name.endswith(".js")): continue
+      if any(s in path.replace('\\', '/') for s in ['tinygrad/runtime/autogen', 'tinygrad/viz/assets']): continue
       filepath = os.path.join(path, name)
       relfilepath = os.path.relpath(filepath, base_path).replace('\\', '/')
-      with tokenize.open(filepath) as file_:
-        tokens = [t for t in tokenize.generate_tokens(file_.readline) if t.type in TOKEN_WHITELIST and not is_docstring(t)]
-        token_count, line_count = len(tokens), len(set([x for t in tokens for x in range(t.start[0], t.end[0]+1)]))
-        if line_count > 0: table.append([relfilepath, line_count, token_count/line_count])
+      if name.endswith(".js"):
+        with open(filepath) as file_: lines = [line.strip() for line in file_.readlines()]
+        token_count, line_count = sum(len(line.split()) for line in lines if is_js_token(line)), sum(1 for line in lines if is_js_token(line))
+      else:
+        with tokenize.open(filepath) as file_:
+          tokens = [t for t in tokenize.generate_tokens(file_.readline) if t.type in TOKEN_WHITELIST and not is_docstring(t)]
+          token_count, line_count = len(tokens), len(set([x for t in tokens for x in range(t.start[0], t.end[0]+1)]))
+      if line_count > 0: table.append([relfilepath, line_count, token_count/line_count])
   return table
 
 def gen_diff(table_old, table_new):
@@ -48,6 +56,8 @@ def gen_diff(table_old, table_new):
 
 def display_diff(diff): return "+"+str(diff) if diff > 0 else str(diff)
 
+NONCORE_DIRS = {"tinygrad/apps", "tinygrad/nn", "tinygrad/renderer", "tinygrad/runtime", "tinygrad/viz"}
+
 if __name__ == "__main__":
   if len(sys.argv) == 3:
     headers = ["Name", "Lines", "Diff", "Tokens/Line", "Diff"]
@@ -70,9 +80,16 @@ if __name__ == "__main__":
     else:
       print(tabulate([headers] + sorted(table, key=lambda x: -x[1]), headers="firstrow", floatfmt=".1f")+"\n")
       groups = sorted([('/'.join(x[0].rsplit("/", 1)[0].split("/")[0:2]), x[1], x[2]) for x in table])
-      for dir_name, group in itertools.groupby(groups, key=lambda x:x[0]):
-        print(f"{dir_name:30s} : {sum([x[1] for x in group]):6d}")
+      dir_sizes = {}
+      for dir_name, _group in itertools.groupby(groups, key=lambda x:x[0]):
+        group = list(_group)
+        dir_sizes[dir_name] = sum([x[1] for x in group])
+        print(f"{dir_name:30s} : {dir_sizes[dir_name]:6d} in {len(group):2d} files")
+      print()
+      print(f"        ops: {len(Ops)}")
+      print(f"      flags: {len(ContextVar._cache)}")
+      print(f" core lines: {sum([v for k,v in dir_sizes.items() if k not in NONCORE_DIRS])}")
       total_lines = sum([x[1] for x in table])
-      print(f"\ntotal line count: {total_lines}")
+      print(f"total lines: {total_lines}")
       max_line_count = int(os.getenv("MAX_LINE_COUNT", "-1"))
       assert max_line_count == -1 or total_lines <= max_line_count, f"OVER {max_line_count} LINES"
